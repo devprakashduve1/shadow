@@ -115,9 +115,7 @@ _NATIVE_APP_RULES.extend(
 )
 
 # Browsers whose AppleScript dictionary reliably exposes "tabs of window" /
-# "URL of tab" (all Chromium-based, plus Safari). Each app is wrapped in its
-# own try block so one browser's scripting quirks can't blank out results
-# already collected from the others.
+# "URL of tab" (all Chromium-based, plus Safari).
 _BROWSER_APPS = ["Google Chrome", "Microsoft Edge", "Brave Browser", "Safari"]
 
 # Existence is checked via System Events' running-process list ("exists
@@ -126,26 +124,47 @@ _BROWSER_APPS = ["Google Chrome", "Microsoft Edge", "Brave Browser", "Safari"]
 # isn't installed that can pop a "select an application" locate dialog
 # instead of failing quietly. Any browser not installed/not running is just
 # skipped, silently, like every other not-found app in this module.
-_ALL_BROWSER_TAB_URLS_SCRIPT = """
+#
+# IMPORTANT: this MUST use a literal app name in "tell application", never a
+# loop variable (e.g. `repeat with appName in {...}` then `tell application
+# appName`). AppleScript resolves which app's terminology (like "tabs of
+# window") applies to a `tell application` block at compile time from a
+# literal string; with a variable it can't determine the target app's
+# dictionary and silently falls back to a generic one that has no "tabs"
+# property, so `tabs of w` throws -1700 every time. That's why this used to
+# be one script loop over all browsers — and why no browser-based meeting
+# was ever actually detected.
+#
+# Each browser also gets its OWN separate osascript call (rather than one
+# combined script for all of them) so that one browser's pending "<App>
+# would like to control this computer" Automation permission dialog — which
+# blocks the whole script until answered or timed out — can't also starve
+# out the others. A single combined script means e.g. an unanswered Safari
+# permission prompt silently zeroes out Chrome's results too, since the
+# whole script hangs until _run_osascript's timeout and then returns "".
+def _browser_tab_urls_script(app: str) -> str:
+    return f"""
 set urls to {{}}
 tell application "System Events"
-    repeat with appName in {app_list}
-        try
-            if exists process appName then
-                tell application appName
-                    repeat with w in windows
-                        repeat with t in tabs of w
-                            set end of urls to URL of t
-                        end repeat
-                    end repeat
-                end tell
-            end if
-        end try
-    end repeat
+    set appRunning to exists process "{app}"
 end tell
+if appRunning then
+    try
+        tell application "{app}"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    set end of urls to URL of t
+                end repeat
+            end repeat
+        end tell
+    end try
+end if
 set AppleScript's text item delimiters to linefeed
 return urls as text
-""".format(app_list="{" + ", ".join(f'"{a}"' for a in _BROWSER_APPS) + "}")
+"""
+
+
+_BROWSER_TAB_URL_SCRIPTS = {app: _browser_tab_urls_script(app) for app in _BROWSER_APPS}
 
 # Every native-app process worth polling, gathered in one osascript call
 # (rather than one call per app) to keep per-poll overhead low.
@@ -194,14 +213,15 @@ def _run_osascript(script: str, timeout: float = 5.0) -> str:
 
 
 def _active_browser_meeting() -> Optional[CallState]:
-    output = _run_osascript(_ALL_BROWSER_TAB_URLS_SCRIPT, timeout=6.0)
-    for url in output.splitlines():
-        url = url.strip()
-        if not url:
-            continue
-        for source, pattern in _BROWSER_MEETING_PATTERNS:
-            if pattern.search(url):
-                return CallState(active=True, source=source, label=url)
+    for app in _BROWSER_APPS:
+        output = _run_osascript(_BROWSER_TAB_URL_SCRIPTS[app], timeout=3.0)
+        for url in output.splitlines():
+            url = url.strip()
+            if not url:
+                continue
+            for source, pattern in _BROWSER_MEETING_PATTERNS:
+                if pattern.search(url):
+                    return CallState(active=True, source=source, label=url)
     return None
 
 

@@ -31,8 +31,11 @@ class SearchEngine:
                 continue
             if source and entry.source != source:
                 continue
-            if keyword and keyword.lower() not in entry.text.lower():
-                continue
+            if keyword:
+                title = entry.extra.get("title", "")
+                haystack = f"{title}\n{entry.text}".lower()
+                if keyword.lower() not in haystack:
+                    continue
 
             matches.append(entry)
         return matches
@@ -41,7 +44,7 @@ class SearchEngine:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "source", "text"])
+            writer.writerow(["timestamp", "source", "title", "text"])
             for entry in entries:
-                writer.writerow([entry.timestamp, entry.source, entry.text])
+                writer.writerow([entry.timestamp, entry.source, entry.extra.get("title", ""), entry.text])
         return path

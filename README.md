@@ -134,7 +134,8 @@ This opens the dashboard with two tabs:
 | Disable video preview *(checked by default)*           | keeps gesture tracking running but stops rendering the camera feed — check it off if you want to see the camera preview for debugging |
 | Enable screen capture *(off by default, auto-toggled)* | starts/stops periodic screen capture + change detection. Off at launch — automatically checked the moment a Slack/Meet call is detected, and automatically unchecked again when the call ends, so screen context lines up with meeting audio. You can still toggle it manually any other time. |
 | Enable OCR on change *(checked by default)*             | runs OCR (and logs the text) whenever the captured screen changes — independent of the screen-capture checkbox above, so you can capture frames without OCR'ing them |
-| Enable call detection *(checked by default)*            | starts/stops the background watcher for an active Slack huddle or Google Meet call |
+| Capture screen on every mouse click *(off by default)*  | when on (and OCR is enabled), every system-wide mouse click forces an immediate screen capture + OCR pass instead of waiting for the next `screen.capture_interval_seconds` tick — still skipped while the frontmost window/tab is excluded (see `screen.excluded_apps` / `excluded_domains` below). Requires macOS Accessibility permission for the click listener, same as gesture mouse control. |
+| Enable call detection *(checked by default)*            | starts/stops the background watcher for an active Slack huddle or Google Meet call — a toast popup fires in the top-right corner the moment any call/huddle/meeting is first detected |
 | Enable voice transcription *(checked by default)*       | independent of call detection above — when off, calls are still detected (status label updates) but the mic is never recorded/transcribed; toggling this off mid-call stops an in-progress recording immediately (see [Known limitations](#known-limitations)) |
 | Enable spell-check popups *(running by default, no exclusions)* | watches keystrokes **system-wide** (any app, always) and pops up spelling suggestions — read [Spell check](#spell-check-system-wide) for safety notes |
 
@@ -159,6 +160,14 @@ policy for how far it splits:
 as the immediately preceding one logged on that channel (e.g. OCR re-reading
 an unchanged screen), it's silently skipped — `log_ocr()`/`log_transcript()`
 return `None` in that case instead of writing anything.
+
+**Title**: every screen-OCR entry also gets a `title` — the topmost line of
+text detected on the screenshot (`OCREngine.extract_text_with_title` in
+`ocr/ocr_engine.py`), typically a window title bar or page/section header
+since headers sit above the content they label. It's stored in the JSON
+entry's `extra.title` field, shown as its own column in the Search tab and in
+CSV exports, prefixed onto the `.txt` log line, and included when feeding
+entries to the summarizer.
 
 The **Search** tab reads every `Shadow_*.jsonl` file under a day folder.
 
@@ -189,6 +198,64 @@ Notes:
   (`_MAX_ENTRY_CHARS` in `summarize/log_summarizer.py`) to fit a small
   model's context window — summarize a narrower search (tighter date range/
   keyword) if you need older entries included.
+
+#### How gemma4 is wired into the app
+
+There's no model-serving code in this repo at all — Ollama does that part.
+The app is purely an HTTP *client* of Ollama's local REST API, matching the
+"no heavy ML dependency for an optional feature" approach used elsewhere
+(e.g. `faster-whisper`/`easyocr` are only imported when their feature is
+actually used). The full connection path, click to response:
+
+1. **You pull the model once, outside the app**: `ollama pull gemma4`. Ollama
+   stores and serves it; this app never downloads or loads model weights
+   itself.
+2. **Config** (`config/default_settings.yaml`, `summarize:` block) declares
+   which model/server/timeout to use — nothing here is hardcoded in Python:
+   ```yaml
+   summarize:
+     base_url: http://localhost:11434   # Ollama's default local API port
+     model: gemma4
+     timeout_seconds: 180
+   ```
+3. **Button click → background thread**: `gui/dashboard.py`'s
+   `_run_summarize()` reads those three config values plus the current
+   search results and the optional instructions field, then hands them to
+   `gui/workers.py`'s `SummarizeWorker` (a `QThread`) so a slow/first-load
+   model call can't freeze the GUI. `SummarizeWorker.run()` does exactly one
+   thing: construct a `LogSummarizer` and call `.summarize(entries,
+   instructions)`.
+4. **`LogSummarizer.summarize()`** (`summarize/log_summarizer.py`) is the
+   actual client:
+   - Formats every matched `LogEntry` into a plain-text line —
+     `[HH:MM:SS] (source: title) text` — via `_format_entries()`, trimmed to
+     the most recent ~12,000 characters so it fits a small model's context.
+   - Builds one prompt: a fixed system instruction (`_SYSTEM_PROMPT` — stay
+     factual, call out topics/decisions/action items/people, don't invent
+     anything not in the entries) + your optional free-text instructions +
+     the formatted log text.
+   - POSTs it as JSON to Ollama's **generate** endpoint —
+     `POST {base_url}/api/generate` with body
+     `{"model": "gemma4", "prompt": <the full prompt>, "stream": false}` —
+     using nothing but the Python stdlib's `urllib.request` (no `ollama`
+     package, no `requests`; this is the whole reason it's a hard
+     dependency-free HTTP call rather than an SDK integration).
+   - `stream: false` means Ollama buffers the full generation server-side and
+     replies with one JSON object once it's done, rather than the
+     chunked/streamed response Ollama also supports — simpler client code,
+     at the cost of no incremental output while the model is still thinking.
+   - Reads `response["response"]` out of that JSON as the summary text.
+5. **Errors surface, they don't crash**: connection refused (Ollama not
+   running), a non-2xx HTTP status (e.g. model not pulled), or a malformed
+   response are each caught and re-raised as a `SummarizerError` with a
+   specific one-line message; `SummarizeWorker` catches that and emits it on
+   its `error` signal, which the dashboard shows in the status label instead
+   of the summary box.
+
+Nothing here is gemma4-specific — `summarize.model` is just a string handed
+straight to Ollama's `/api/generate`, so pointing it at any other model
+you've pulled (`llama3.2`, `mistral`, ...) works identically with zero code
+changes.
 
 ### Screen capture exclusions
 
@@ -331,7 +398,14 @@ further:
 - Call auto-capture requires Automation permission for your terminal/app to
   control Google Chrome, Safari, and System Events, in addition to Microphone
   access — grant these under **System Settings > Privacy & Security >
-  Automation / Microphone**.
+  Automation / Microphone**. Each of Chrome/Edge/Brave/Safari is authorized
+  **separately** and only prompts the first time it's actually polled — if a
+  prompt appears (it can show up behind other windows) and is left
+  unanswered, detection for every browser stalls until it's dismissed, since
+  `callwatch/call_detector.py` polls each browser with its own short timeout
+  and gives up silently rather than blocking forever. If call detection
+  never seems to fire, check for a pending "`<App>` would like to control
+  this computer" dialog first.
 - `faster-whisper` and `easyocr` will download model weights on first use;
   ensure network access the first time each runs, or pre-populate `models/`.
 - Summarization (`summarize/`) depends entirely on a local Ollama server

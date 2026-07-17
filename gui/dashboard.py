@@ -80,6 +80,58 @@ class SpellSuggestionPopup(QWidget):
         QTimer.singleShot(self.DISPLAY_MS, self.close)
 
 
+class CallAlertPopup(QWidget):
+    """Small, non-modal, auto-dismissing toast announcing a newly detected call/huddle/meeting.
+
+    Shown top-right (vs. SpellSuggestionPopup's bottom-right) so the two
+    never overlap even if both fire around the same time.
+    """
+
+    DISPLAY_MS = 6000
+
+    _SOURCE_LABELS = {
+        "slack": "Slack huddle",
+        "google_meet": "Google Meet",
+        "zoom": "Zoom meeting",
+        "teams": "Microsoft Teams meeting",
+        "webex": "Webex meeting",
+        "gotomeeting": "GoToMeeting",
+        "whereby": "Whereby meeting",
+        "around": "Around meeting",
+        "facetime": "FaceTime call",
+        "skype": "Skype call",
+    }
+
+    def __init__(self, source: str, label: str, parent: QWidget) -> None:
+        super().__init__(
+            parent,
+            Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        kind = self._SOURCE_LABELS.get(source, source or "Call")
+        text = f"\U0001F4DE {kind} detected"
+        if label:
+            text += f"\n{label}"
+        message = QLabel(text)
+        message.setStyleSheet(
+            "background-color: #1b4d2e; color: white; padding: 10px; border-radius: 6px;"
+        )
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(message)
+        self.setLayout(layout)
+
+        self.adjustSize()
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+            self.move(geo.right() - self.width() - 20, geo.top() + 20)
+
+        QTimer.singleShot(self.DISPLAY_MS, self.close)
+
+
 def _to_pixmap(frame_rgb: np.ndarray) -> QPixmap:
     h, w, ch = frame_rgb.shape
     image = QImage(frame_rgb.data, w, h, ch * w, QImage.Format.Format_RGB888)
@@ -114,6 +166,7 @@ class LiveMonitorTab(QWidget):
 
         self.screen_capture_checkbox = QCheckBox("Enable screen capture")
         self.ocr_checkbox = QCheckBox("Enable OCR on change")
+        self.mouse_capture_checkbox = QCheckBox("Capture screen on every mouse click (system-wide)")
 
         self.call_detect_checkbox = QCheckBox("Enable call detection (watch for Slack/Google Meet calls)")
         self.call_transcribe_checkbox = QCheckBox("Enable voice transcription")
@@ -135,6 +188,7 @@ class LiveMonitorTab(QWidget):
         self.mouse_control_checkbox.toggled.connect(self._toggle_mouse_control)
         self.screen_capture_checkbox.toggled.connect(self._toggle_screen_capture)
         self.ocr_checkbox.toggled.connect(self._toggle_ocr)
+        self.mouse_capture_checkbox.toggled.connect(self._toggle_mouse_capture)
         self.disable_video_checkbox.toggled.connect(self._toggle_video_preview)
         self.call_detect_checkbox.toggled.connect(self._toggle_call_detect)
         self.call_transcribe_checkbox.toggled.connect(self._toggle_call_transcribe)
@@ -169,6 +223,7 @@ class LiveMonitorTab(QWidget):
         screen_layout.addWidget(self.screen_label)
         screen_layout.addWidget(self.screen_capture_checkbox)
         screen_layout.addWidget(self.ocr_checkbox)
+        screen_layout.addWidget(self.mouse_capture_checkbox)
         screen_layout.addWidget(self.window_status)
         screen_layout.addWidget(QLabel("Latest extracted text:"))
         screen_layout.addWidget(self.ocr_output)
@@ -252,6 +307,7 @@ class LiveMonitorTab(QWidget):
             capture_interval_seconds=settings.get("screen.capture_interval_seconds", 1.0),
             excluded_apps=settings.get("screen.excluded_apps", []),
             excluded_domains=settings.get("screen.excluded_domains", []),
+            capture_on_mouse_event=settings.get("screen.capture_on_mouse_event", False),
         )
         ocr_cfg = dict(
             engine=settings.get("ocr.engine", "easyocr"),
@@ -264,6 +320,7 @@ class LiveMonitorTab(QWidget):
         self._screen_worker.window_changed.connect(self._on_window_changed)
         self._screen_worker.error.connect(self._on_worker_error)
         self._screen_worker.ocr_enabled = self.ocr_checkbox.isChecked()
+        self._screen_worker.capture_on_mouse_event = self.mouse_capture_checkbox.isChecked()
         self._screen_worker.start()
 
     def _stop_screen(self) -> None:
@@ -303,6 +360,7 @@ class LiveMonitorTab(QWidget):
         self._call_worker.status_changed.connect(self.call_status_label.setText)
         self._call_worker.transcript_ready.connect(self._on_call_transcript)
         self._call_worker.call_active_changed.connect(self._on_call_active_changed)
+        self._call_worker.call_detected.connect(self._on_call_detected)
         self._call_worker.error.connect(self._on_call_worker_error)
         self._call_worker.transcription_enabled = self.call_transcribe_checkbox.isChecked()
         self._call_worker.start()
@@ -316,6 +374,10 @@ class LiveMonitorTab(QWidget):
 
     def _on_call_transcript(self, source: str, text: str) -> None:
         self.call_transcript_output.append(f"[{source}] {text}")
+
+    def _on_call_detected(self, source: str, label: str) -> None:
+        popup = CallAlertPopup(source, label, parent=self)
+        popup.show()
 
     def _on_call_active_changed(self, active: bool) -> None:
         # Screen capture is off by default and only auto-enabled while a
@@ -383,6 +445,10 @@ class LiveMonitorTab(QWidget):
         if self._screen_worker is not None:
             self._screen_worker.ocr_enabled = checked
 
+    def _toggle_mouse_capture(self, checked: bool) -> None:
+        if self._screen_worker is not None:
+            self._screen_worker.capture_on_mouse_event = checked
+
     def _toggle_video_preview(self, checked: bool) -> None:
         if checked:
             self.camera_label.clear()
@@ -407,8 +473,8 @@ class LiveMonitorTab(QWidget):
             return
         self.gesture_status.setText(f"Gesture: {result.gesture} ({result.handedness})")
 
-    def _on_text_extracted(self, text: str) -> None:
-        self.ocr_output.setPlainText(text)
+    def _on_text_extracted(self, title: str, text: str) -> None:
+        self.ocr_output.setPlainText(f"[{title}]\n{text}" if title else text)
 
     def _on_window_changed(self, app_name: str) -> None:
         self.window_status.setText(f"Active window: {app_name}")
@@ -444,8 +510,8 @@ class SearchTab(QWidget):
 
         self.search_btn = QPushButton("Search")
         self.export_btn = QPushButton("Export CSV")
-        self.results_table = QTableWidget(0, 3)
-        self.results_table.setHorizontalHeaderLabels(["Timestamp", "Source", "Text"])
+        self.results_table = QTableWidget(0, 4)
+        self.results_table.setHorizontalHeaderLabels(["Timestamp", "Source", "Title", "Text"])
         self.results_table.horizontalHeader().setStretchLastSection(True)
 
         self.summarize_instructions_input = QLineEdit()
@@ -508,7 +574,8 @@ class SearchTab(QWidget):
         for row, entry in enumerate(self._results):
             self.results_table.setItem(row, 0, QTableWidgetItem(entry.timestamp))
             self.results_table.setItem(row, 1, QTableWidgetItem(entry.source))
-            self.results_table.setItem(row, 2, QTableWidgetItem(entry.text[:200]))
+            self.results_table.setItem(row, 2, QTableWidgetItem(entry.extra.get("title", "")))
+            self.results_table.setItem(row, 3, QTableWidgetItem(entry.text[:200]))
 
     def _export_results(self) -> None:
         if not self._results:

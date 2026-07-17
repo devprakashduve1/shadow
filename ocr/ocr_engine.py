@@ -47,3 +47,26 @@ class OCREngine:
                 conf = float(data["conf"][i]) if data["conf"][i] != "-1" else 0.0
                 out.append((text, conf, bbox))
             return out
+
+    def _top_y(self, bbox) -> float:
+        """Smallest y-coordinate of a bbox, in either the 4-point (EasyOCR) or (left, top, w, h) (Tesseract) form."""
+        if self.engine == "easyocr":
+            return min(point[1] for point in bbox)
+        return bbox[1]
+
+    def extract_text_with_title(self, image: np.ndarray) -> tuple[str, str]:
+        """Runs OCR once and returns (full_text, title).
+
+        `title` is the topmost detected line of text on the screenshot — in
+        practice a window title bar, page header, or other parent/section
+        heading — since headers sit above the body content they label. Used
+        to give each logged screenshot entry a human-readable label instead
+        of just a wall of extracted text.
+        """
+        boxes = self.extract_with_boxes(image)
+        lines = [text for text, _, _ in boxes if text.strip()]
+        full_text = "\n".join(lines)
+        if not boxes:
+            return full_text, ""
+        title = min(boxes, key=lambda b: self._top_y(b[2]))[0].strip()
+        return full_text, title
