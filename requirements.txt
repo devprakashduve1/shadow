@@ -1,0 +1,16 @@
+opencv-python>=4.9.0
+mediapipe==0.10.14  # >=0.10.30 dropped the legacy mp.solutions API used by gesture/gesture_recognizer.py
+pyautogui>=0.9.54
+pynput==1.8.2  # spellcheck/_pynput_darwin_patch.py patches _darwin.py internals for this version
+mss>=9.0.1
+pytesseract>=0.3.10
+easyocr>=1.7.1
+faster-whisper>=1.0.1
+sounddevice>=0.4.6
+PyQt6>=6.6.1
+numpy>=1.26.4
+pandas>=2.2.1
+PyYAML>=6.0.1
+Pillow>=10.2.0
+pyspellchecker>=0.8.1
+language_tool_python>=2.7.0  # grammar checking; requires a local JRE (see README "Spell check")

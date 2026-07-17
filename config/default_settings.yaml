@@ -1,0 +1,86 @@
+app:
+  name: Shadow
+  output_dir: output
+
+camera:
+  device_index: 0
+  width: 640
+  height: 480
+  fps: 30
+
+gesture:
+  detection_confidence: 0.7
+  tracking_confidence: 0.7
+  max_hands: 1
+  pinch_click_threshold: 0.04
+  smoothing: 0.5
+
+mouse:
+  enabled: true
+  screen_margin: 0.1
+
+screen:
+  monitor_index: 0
+  capture_interval_seconds: 1.0
+  change_threshold: 0.02
+  # Case-insensitive substring match against the frontmost process name OR
+  # window title (macOS). Whenever a match is frontmost, screen capture,
+  # preview, OCR, and session-file creation are all fully paused.
+  # "Shadow" excludes this app's own window AND any Finder/editor/terminal
+  # window showing the Shadow project or output folder, since those windows'
+  # titles also contain "Shadow" (its process name is "python" when
+  # unbundled, but its window title is "Shadow").
+  excluded_apps: ["Claude", "Shadow"]
+  # Case-insensitive substring match against the active browser tab's URL
+  # (Chrome/Safari only). Same pause behavior as excluded_apps above.
+  excluded_domains: ["vista.adp.com", "mail.google.com", "outlook.office.com", "web.whatsapp.com"]
+
+ocr:
+  engine: easyocr
+  languages: ["en"]
+  tesseract_cmd: null
+
+audio:
+  enabled: false
+  device_index: null
+  sample_rate: 16000
+  channels: 1
+  chunk_seconds: 5
+
+speech:
+  engine: faster-whisper
+  model_size: base
+  language: en
+
+callwatch:
+  poll_interval_seconds: 3.0
+
+# System-wide, offline spelling + grammar suggestions as you type (see
+# gui/workers.py SpellCheckWorker). Enabled by default with NO exclusions —
+# it observes every keystroke on this Mac regardless of which app/site is
+# frontmost (functionally a keylogger), though it never writes anything to
+# disk. Requires macOS "Input Monitoring" permission. See README.md's "Spell
+# check (system-wide)" section for the full safety notes before relying on
+# this.
+#
+# Grammar checking (grammar_enabled) uses language_tool_python, which runs a
+# local Java-based LanguageTool server — requires a JRE on PATH/JAVA_HOME and
+# downloads a ~250MB bundle on first use (cached afterward). Set
+# grammar_enabled: false to skip this and use spelling-only checks if Java
+# isn't available.
+spellcheck:
+  language: en
+  grammar_enabled: true
+  grammar_language: en-US
+
+logging:
+  format: json
+  base_dir: ~/Desktop/Shadow
+
+# Summarizes Search-tab results via a local Ollama model — see summarize/log_summarizer.py.
+# Requires `ollama serve` running locally with the model already pulled
+# (e.g. `ollama pull gemma4`); this feature does nothing without it.
+summarize:
+  base_url: http://localhost:11434
+  model: gemma4
+  timeout_seconds: 180
