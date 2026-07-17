@@ -4,6 +4,25 @@ A desktop productivity/accessibility app that combines hand-gesture mouse contro
 desktop screen monitoring with OCR, and speech-to-text transcription into a single
 PyQt6 dashboard with searchable logs.
 
+## Contents
+
+- [Features](#features)
+- [Project layout](#project-layout)
+- [Setup](#setup)
+  - [macOS permissions checklist](#macos-permissions-checklist)
+  - [Other macOS notes](#other-macos-notes)
+- [Running](#running)
+  - [Live Monitor controls](#live-monitor-controls)
+  - [Session files](#session-files)
+  - [Summarize (local LLM)](#summarize-local-llm)
+  - [Screen capture exclusions](#screen-capture-exclusions)
+  - [Spell check (system-wide)](#spell-check-system-wide)
+- [Configuration](#configuration)
+- [Gesture vocabulary](#gesture-vocabulary)
+- [Troubleshooting](#troubleshooting)
+- [Roadmap](#roadmap)
+- [Known limitations](#known-limitations)
+
 ## Features
 
 - Hand-gesture mouse control (webcam + MediaPipe + pynput)
@@ -371,6 +390,28 @@ All thresholds live in `config/default_settings.yaml` under `gesture:` and
 - `gesture.max_hands` — number of hands tracked at once (only the first
   detected hand drives the mouse).
 - `gesture.smoothing`, `mouse.screen_margin` — cursor feel, as above.
+
+## Troubleshooting
+
+A symptom-first index of the issues most likely to come up, with a pointer to
+the relevant section for the full explanation.
+
+| Symptom | Likely cause | See |
+|---|---|---|
+| A feature "does nothing" — no crash, no output | Missing macOS privacy permission for whichever app launches `python main.py` | [macOS permissions checklist](#macos-permissions-checklist) |
+| Call detection never fires for any browser, even one you know is in a meeting | A **different** browser (Edge/Brave/Safari) has an unanswered "would like to control this computer" prompt — check for it, it can be hidden behind other windows | [Known limitations](#known-limitations) |
+| Call detection never fires for a specific app/browser only | That app's window/tab title just doesn't match the expected pattern (e.g. Slack huddle title changed, or an unlisted browser) — this is a heuristic, not an API integration | [Known limitations](#known-limitations) |
+| "Summarize results" shows "Run a search above first" | Your last search matched zero entries, or you haven't run one yet — check your keyword/date/source filters | [Summarize (local LLM)](#summarize-local-llm) |
+| "Summarize results" seems stuck on "Summarizing..." | Likely just the first call after Ollama (re)starts — loading an 8B model into memory alone can take 10+ seconds before generation even begins | [Summarize (local LLM)](#summarize-local-llm) |
+| "Summarize results" shows an error | `ollama serve`/Ollama.app isn't running, or the configured model (`summarize.model`, default `gemma4`) hasn't been pulled — the error message names which | [Summarize (local LLM)](#summarize-local-llm) |
+| Spell check / gesture mouse control does nothing | Input Monitoring / Accessibility permission not granted, or granted to the wrong app (e.g. iTerm instead of Terminal) | [macOS permissions checklist](#macos-permissions-checklist) |
+| Grammar suggestions never appear (spelling still works) | Java (JRE) isn't installed/on PATH, or `spellcheck.grammar_enabled: false` | [Spell check (system-wide)](#spell-check-system-wide) |
+| The whole app crashes on launch (`EXC_BREAKPOINT`) | Should already be handled — see the pynput/macOS patch note | [Known limitations](#known-limitations) |
+| Screen/OCR pipeline seems paused for a window you didn't expect | It matches `screen.excluded_apps` / `excluded_domains`, or its title starts with "Shadow" | [Screen capture exclusions](#screen-capture-exclusions) |
+
+If none of these match, check the relevant worker's `error` signal handler in
+`gui/dashboard.py` — every background pipeline (`gui/workers.py`) surfaces
+failures to a status label instead of failing silently or crashing the GUI.
 
 ## Roadmap
 
