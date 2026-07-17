@@ -41,7 +41,9 @@ def _format_entries(entries: Sequence[LogEntry]) -> str:
     lines = []
     for entry in entries:
         time_part = entry.timestamp.split("T")[-1][:8] or entry.timestamp  # HH:MM:SS
-        lines.append(f"[{time_part}] ({entry.source}) {entry.text}")
+        title = entry.extra.get("title")
+        label = f"{entry.source}: {title}" if title else entry.source
+        lines.append(f"[{time_part}] ({label}) {entry.text}")
     text = "\n".join(lines)
     if len(text) > _MAX_ENTRY_CHARS:
         text = text[-_MAX_ENTRY_CHARS:]

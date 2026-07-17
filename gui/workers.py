@@ -81,6 +81,7 @@ class CallVoiceCaptureWorker(QThread):
     status_changed = pyqtSignal(str)
     transcript_ready = pyqtSignal(str, str)  # (source, text)
     call_active_changed = pyqtSignal(bool)  # fires on every active<->inactive transition
+    call_detected = pyqtSignal(str, str)  # (source, label) — fires only on inactive->active transitions
     error = pyqtSignal(str)
 
     def __init__(self, audio_cfg: dict, speech_cfg: dict, logger: DataLogger, poll_interval: float = 3.0, parent=None):
@@ -110,6 +111,8 @@ class CallVoiceCaptureWorker(QThread):
                 if state.active != was_active:
                     was_active = state.active
                     self.call_active_changed.emit(state.active)
+                    if state.active:
+                        self.call_detected.emit(state.source, state.label)
                 should_capture = state.active and self.transcription_enabled
 
                 if should_capture and capture is None:
@@ -154,7 +157,7 @@ class CallVoiceCaptureWorker(QThread):
 
 class ScreenOcrWorker(QThread):
     frame_ready = pyqtSignal(np.ndarray)
-    text_extracted = pyqtSignal(str)
+    text_extracted = pyqtSignal(str, str)  # (title, text) — title is the topmost/parent section heading on screen
     window_changed = pyqtSignal(str)
     error = pyqtSignal(str)
 
@@ -165,15 +168,40 @@ class ScreenOcrWorker(QThread):
         self._logger = logger
         self._running = False
         self.ocr_enabled = False
+        # When True, every system-wide mouse click wakes the capture loop
+        # immediately instead of waiting out the normal poll interval — set
+        # at any time, checked live from the mouse listener callback below.
+        self.capture_on_mouse_event = screen_cfg.get("capture_on_mouse_event", False)
         self._excluded_apps = screen_cfg.get("excluded_apps", [])
         self._excluded_domains = screen_cfg.get("excluded_domains", [])
+        self._mouse_trigger = threading.Event()
+        self._mouse_listener = None
 
     def _is_excluded(self, window) -> bool:
         return is_window_excluded(window, self._excluded_apps, self._excluded_domains)
 
+    def _on_mouse_click(self, x, y, button, pressed) -> None:
+        if pressed and self.capture_on_mouse_event:
+            self._mouse_trigger.set()
+
+    def _wait(self, interval: float) -> bool:
+        """Sleeps for `interval` seconds, but wakes early on a mouse-click trigger.
+
+        Returns whether the wake was caused by a mouse click (vs. the interval
+        simply elapsing), so the caller can tell the two apart.
+        """
+        mouse_triggered = self._mouse_trigger.wait(timeout=interval)
+        self._mouse_trigger.clear()
+        return mouse_triggered
+
     def run(self) -> None:
+        from pynput import mouse
+
         self._running = True
         last_state_key = None  # (app_name, excluded) — tracks both, not just app_name
+        mouse_triggered = False  # whether the *previous* wait woke us due to a click
+        self._mouse_listener = mouse.Listener(on_click=self._on_mouse_click)
+        self._mouse_listener.start()
         try:
             capture = ScreenCapture(
                 monitor_index=self._screen_cfg.get("monitor_index", 0),
@@ -194,7 +222,7 @@ class ScreenOcrWorker(QThread):
                     if state_key != last_state_key:
                         last_state_key = state_key
                         self.window_changed.emit(f"{window.app_name} (excluded — not captured)")
-                    time.sleep(interval)
+                    mouse_triggered = self._wait(interval)
                     continue
 
                 self.frame_ready.emit(frame)
@@ -203,15 +231,15 @@ class ScreenOcrWorker(QThread):
                     last_state_key = state_key
                     self.window_changed.emit(window.app_name)
 
-                if changed and self.ocr_enabled:
+                if self.ocr_enabled and (changed or mouse_triggered):
                     if ocr is None:
                         ocr = OCREngine(**self._ocr_cfg)
-                    text = ocr.extract_text(frame)
+                    text, title = ocr.extract_text_with_title(frame)
                     if text.strip():
-                        self._logger.log_ocr(text)
-                        self.text_extracted.emit(text)
+                        self._logger.log_ocr(text, extra={"title": title})
+                        self.text_extracted.emit(title, text)
 
-                time.sleep(interval)
+                mouse_triggered = self._wait(interval)
         except Exception as exc:
             self.error.emit(str(exc))
         finally:
@@ -219,9 +247,12 @@ class ScreenOcrWorker(QThread):
                 capture.close()
             except Exception:
                 pass
+            if self._mouse_listener is not None:
+                self._mouse_listener.stop()
 
     def stop(self) -> None:
         self._running = False
+        self._mouse_trigger.set()  # unblock a pending _wait() so stop() doesn't wait out a long interval
         self.wait(2000)
 
 

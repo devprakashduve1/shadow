@@ -109,8 +109,10 @@ class DataLogger:
         events_filename, notes_filename = self._filenames(channel)
         with open(day_dir / events_filename, "a") as f:
             f.write(json.dumps(asdict(entry)) + "\n")
+        title = entry.extra.get("title")
+        label = f"{source} — {title}" if title else source
         with open(day_dir / notes_filename, "a") as f:
-            f.write(f"{now.strftime('%H:%M:%S')} [{source}] {text}\n")
+            f.write(f"{now.strftime('%H:%M:%S')} [{label}] {text}\n")
         return entry
 
     def log_ocr(self, text: str, extra: Optional[Dict[str, Any]] = None) -> Optional[LogEntry]:

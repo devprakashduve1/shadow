@@ -34,6 +34,12 @@ screen:
   # Case-insensitive substring match against the active browser tab's URL
   # (Chrome/Safari only). Same pause behavior as excluded_apps above.
   excluded_domains: ["vista.adp.com", "mail.google.com", "outlook.office.com", "web.whatsapp.com"]
+  # When true and OCR is enabled, every system-wide mouse click forces an
+  # immediate screen capture + OCR pass instead of waiting for the next
+  # capture_interval_seconds tick (still skipped while the frontmost window
+  # is excluded above). Requires macOS "Accessibility" permission for the
+  # click listener, same as gesture mouse control.
+  capture_on_mouse_event: false
 
 ocr:
   engine: easyocr
