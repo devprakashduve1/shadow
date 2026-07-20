@@ -8,6 +8,7 @@ PyQt6 dashboard with searchable logs.
 
 - [Features](#features)
 - [Project layout](#project-layout)
+- [Dependencies](#dependencies)
 - [Setup](#setup)
   - [macOS permissions checklist](#macos-permissions-checklist)
   - [Other macOS notes](#other-macos-notes)
@@ -63,6 +64,42 @@ shadow/
   output/     logs, exports (gitignored)
   main.py     app entry point
 ```
+
+## Dependencies
+
+Everything below is pinned/floored in `requirements.txt` and installed by
+`pip install -r requirements.txt` (see [Setup](#setup)). "Used in" points at
+the one or two modules that actually import each package, so you can trace
+exactly what breaks if a package is missing/misbehaving.
+
+| Package | Version | Used in | Purpose |
+|---|---|---|---|
+| `opencv-python` (`cv2`) | `>=4.9.0` | `camera/camera_module.py`, `gesture/gesture_recognizer.py`, `gui/dashboard.py` | Webcam capture (`VideoCapture`) and frame color conversion (BGR↔RGB, mirror flip) |
+| `mediapipe` | `==0.10.14` (pinned) | `gesture/gesture_recognizer.py` | Hand landmark detection/tracking. Pinned because `>=0.10.30` dropped the legacy `mp.solutions` API this module uses |
+| `pyautogui` | `>=0.9.54` | `mouse/mouse_controller.py` | Only used for `pyautogui.size()` — detecting the real screen resolution to map gesture coordinates onto |
+| `pynput` | `==1.8.2` (pinned) | `mouse/mouse_controller.py`, `gui/workers.py`, `spellcheck/_pynput_darwin_patch.py` | Synthesizing real mouse move/click/scroll events, and system-wide mouse-click/keyboard listeners (screen-capture trigger, spell check). Pinned because `_pynput_darwin_patch.py` patches this exact version's internals — see [Known limitations](#known-limitations) |
+| `mss` | `>=9.0.1` | `screen/screen_capture.py` | Cross-platform, fast screenshot capture |
+| `pytesseract` | `>=0.3.10` | `ocr/ocr_engine.py` | Optional OCR engine (wraps the system Tesseract binary) — alternative to the default EasyOCR, set via `ocr.engine: tesseract` |
+| `easyocr` | `>=1.7.1` | `ocr/ocr_engine.py` | Default OCR engine — deep-learning-based text recognition, no external binary required |
+| `faster-whisper` | `>=1.0.1` | `speech/speech_to_text.py` | Local speech-to-text transcription for meeting audio |
+| `sounddevice` | `>=0.4.6` | `audio/audio_capture.py` | Microphone/loopback audio capture |
+| `PyQt6` | `>=6.6.1` | `main.py`, `gui/dashboard.py`, `gui/workers.py` | The GUI framework — main window, widgets, and the `QThread` workers that keep every pipeline off the GUI thread |
+| `numpy` | `>=1.26.4` | `ocr/`, `camera/`, `speech/`, `gesture/`, `audio/`, `screen/`, `gui/` | Shared array representation for frames/audio passed between nearly every pipeline |
+| `PyYAML` | `>=6.0.1` | `config/settings.py` | Parses `config/default_settings.yaml` and the optional local override |
+| `pyspellchecker` | `>=0.8.1` | `spellcheck/spell_checker.py` | Offline, word-level spelling suggestions (system-wide spell check) |
+| `language_tool_python` | `>=2.7.0` | `spellcheck/grammar_checker.py` | Sentence-level grammar checking against a local LanguageTool server — requires a JRE, see [Spell check](#spell-check-system-wide) |
+| `pandas` | `>=2.2.1` | *(none currently)* | Not imported directly anywhere in this codebase today — present in `requirements.txt` but unused by app code, distinct from every other entry here |
+| `Pillow` | `>=10.2.0` | *(none currently)* | Not imported directly either — pulled in transitively as a hard dependency of `easyocr`/`torchvision`, listed explicitly to pin a floor version |
+
+Beyond `requirements.txt`, three things are **not pip packages** and must be
+installed/running separately — each is optional (only its own feature
+degrades without it) and covered in more detail in [Setup](#setup):
+
+| Tool | Needed for | Install |
+|---|---|---|
+| Java (JRE) | Grammar checking (`language_tool_python`) | `brew install openjdk` |
+| Tesseract | OCR, only if you set `ocr.engine: tesseract` instead of the default EasyOCR | `brew install tesseract` |
+| [Ollama](https://ollama.com) | Search-tab "Summarize results" | `brew install ollama` + `ollama pull gemma4` |
 
 ## Setup
 
