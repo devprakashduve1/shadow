@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<!--
+  Host page for the Code tab's side-by-side diff review (gui/ide/diff_view.py).
+
+  Same constraints as monaco_host.html — lives next to `vs/` so relative requires
+  resolve, loaded via QUrl.fromLocalFile, workers shimmed out because Chromium
+  blocks them on file:// origins. See that file for the full reasoning.
+
+  Uses monaco.editor.createDiffEditor, which ships in the same vendored bundle,
+  so no extra assets are needed.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Diff</title>
+    <style>
+      html, body, #container { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; }
+      body { background: #1e1e1e; }
+      #fallback { color: #cccccc; font: 13px -apple-system, sans-serif; padding: 16px; display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="container"></div>
+    <div id="fallback"></div>
+
+    <script>
+      window.MonacoEnvironment = {
+        getWorkerUrl: function () { return "data:text/javascript;charset=utf-8,"; },
+      };
+      window.__shadowReady = false;
+
+      function showFallback(message) {
+        var el = document.getElementById("fallback");
+        el.style.display = "block";
+        el.textContent = message;
+      }
+    </script>
+
+    <script src="vs/loader.js"></script>
+
+    <script>
+      if (typeof require === "undefined") {
+        showFallback("Could not load vs/loader.js. Run: python scripts/fetch_monaco.py");
+      } else {
+        require.config({ paths: { vs: "vs" } });
+
+        require(["vs/editor/editor.main"], function () {
+          window.diffEditor = monaco.editor.createDiffEditor(
+            document.getElementById("container"),
+            {
+              theme: "vs-dark",
+              automaticLayout: true,
+              readOnly: true,
+              // The proposed side stays editable so "Edit manually" works
+              // without swapping in a different editor.
+              originalEditable: false,
+              renderSideBySide: true,
+              fontSize: 13,
+              scrollBeyondLastLine: false,
+            }
+          );
+
+          // --- Python -> JS -------------------------------------------------
+
+          window.shadowSetDiff = function (originalText, proposedText, language) {
+            var original = monaco.editor.createModel(originalText, language || "plaintext");
+            var modified = monaco.editor.createModel(proposedText, language || "plaintext");
+            var previous = window.diffEditor.getModel();
+            window.diffEditor.setModel({ original: original, modified: modified });
+            // Dispose the old pair explicitly — Monaco models are not garbage
+            // collected just because the editor stopped pointing at them, so
+            // reviewing many diffs would otherwise leak steadily.
+            if (previous) {
+              if (previous.original) { previous.original.dispose(); }
+              if (previous.modified) { previous.modified.dispose(); }
+            }
+            modified.onDidChangeContent(function () {
+              if (window.bridge) { window.bridge.proposedEdited(); }
+            });
+          };
+
+          // The modified side is what the user may have hand-edited, so this is
+          // the authoritative text to apply — not the proposal we sent in.
+          window.shadowGetProposed = function () {
+            var model = window.diffEditor.getModel();
+            return model && model.modified ? model.modified.getValue() : "";
+          };
+
+          window.shadowSetProposedEditable = function (editable) {
+            window.diffEditor.updateOptions({ readOnly: !editable });
+          };
+
+          window.shadowSetTheme = function (theme) { monaco.editor.setTheme(theme); };
+
+          window.__shadowReady = true;
+          if (window.bridge) {
+            window.bridge.ready();
+          } else {
+            window.__shadowReadyPendingBridge = true;
+          }
+        });
+      }
+
+      if (typeof QWebChannel !== "undefined" && typeof qt !== "undefined") {
+        new QWebChannel(qt.webChannelTransport, function (channel) {
+          window.bridge = channel.objects.bridge;
+          if (window.__shadowReadyPendingBridge) {
+            window.__shadowReadyPendingBridge = false;
+            window.bridge.ready();
+          }
+        });
+      }
+    </script>
+  </body>
+</html>

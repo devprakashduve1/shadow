@@ -35,7 +35,10 @@ import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, Optional
+
+if TYPE_CHECKING:
+    from database.json_store import EventStore
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -62,10 +65,14 @@ class LogEntry:
 
 
 class DataLogger:
-    def __init__(self, base_dir: str = "output/logs"):
+    def __init__(self, base_dir: str = "output/logs", event_store: Optional["EventStore"] = None):
         self.base_dir = Path(base_dir).expanduser()
         self._last_text: Dict[str, str] = {}  # channel -> last text logged, for dedup
         self._session_stems: Dict[str, str] = {}  # channel -> filename stem override (no extension)
+        # Optional: when set, every logged entry is also redacted, classified,
+        # and persisted as a structured Event (see events/ and database/json_store.py).
+        # None by default so existing callers/tests see no behavior change.
+        self._event_store = event_store
 
     def _day_dir(self, when: Optional[datetime] = None) -> Path:
         when = when or datetime.now()
@@ -113,7 +120,39 @@ class DataLogger:
         label = f"{source} — {title}" if title else source
         with open(day_dir / notes_filename, "a") as f:
             f.write(f"{now.strftime('%H:%M:%S')} [{label}] {text}\n")
+
+        if self._event_store is not None:
+            self._record_structured_event(now, source, text, entry.extra, channel)
+
         return entry
+
+    def _record_structured_event(
+        self, when: datetime, source: str, text: str, extra: Dict[str, Any], channel: str
+    ) -> None:
+        """Redacts + classifies a logged entry and persists it as a structured Event.
+
+        Only ever touches the separate `events.jsonl` file (via EventStore) — the
+        raw JSONL/.txt files written above are unaffected by redaction.
+        """
+        from events.classifier import classify
+        from events.redaction import redact
+        from events.schema import Event as StructuredEvent
+
+        application = extra.get("title") or extra.get("application") or ""
+        clean_text = redact(text)
+        result = classify(clean_text, channel=channel, application=application)
+        structured = StructuredEvent(
+            timestamp=when.isoformat(),
+            type=result.type,
+            title=application or source,
+            application=application,
+            severity=result.severity,
+            source=source,
+            content=clean_text,
+            entities=result.entities,
+            tags=result.tags,
+        )
+        self._event_store.insert_event(structured)
 
     def log_ocr(self, text: str, extra: Optional[Dict[str, Any]] = None) -> Optional[LogEntry]:
         return self.log_event("screen_ocr", text, extra, channel="screen")

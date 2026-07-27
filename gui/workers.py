@@ -9,6 +9,8 @@ from typing import Optional
 import numpy as np
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from assistant.coding_agent import apply_plan, generate_plan
+from assistant.dev_server import detect_start_command, launch_and_open_chrome
 from audio import AudioCapture
 from callwatch import CallDetector
 from camera import CameraModule
@@ -94,6 +96,12 @@ class CallVoiceCaptureWorker(QThread):
         # When False, call detection still runs (status label keeps updating)
         # but no microphone audio is captured/transcribed even if a call is live.
         self.transcription_enabled = True
+        # True only while a microphone AudioCapture is actually open (i.e. a
+        # call/huddle is live AND transcription_enabled) — unlike
+        # transcription_enabled above, this reflects real-time capture state,
+        # not just configuration, so UI indicators (MainWindow's consent
+        # badge) don't claim the mic is recording when it isn't.
+        self.is_recording = False
 
     def run(self) -> None:
         self._running = True
@@ -123,6 +131,7 @@ class CallVoiceCaptureWorker(QThread):
                     chunk_iter = capture.chunks()
                     if stt is None:
                         stt = SpeechToText(**self._speech_cfg)
+                    self.is_recording = True
                 elif not should_capture and capture is not None:
                     # Stops recording whether triggered by the call ending or
                     # by transcription being toggled off mid-call.
@@ -130,6 +139,7 @@ class CallVoiceCaptureWorker(QThread):
                     capture = None
                     chunk_iter = None
                     current_source = ""
+                    self.is_recording = False
                     if state.active:
                         self.status_changed.emit(f"Call detected ({state.source}) — transcription disabled")
                     else:
@@ -149,6 +159,7 @@ class CallVoiceCaptureWorker(QThread):
         finally:
             if capture is not None:
                 capture.stop()
+            self.is_recording = False
 
     def stop(self) -> None:
         self._running = False
@@ -423,6 +434,250 @@ class SummarizeWorker(QThread):
             summarizer = LogSummarizer(**self._summarize_cfg)
             summary = summarizer.summarize(self._entries, self._instructions)
             self.finished_ok.emit(summary)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class DictationWorker(QThread):
+    """Records the microphone until `stop_recording()`, then transcribes it once.
+
+    Backs the chat boxes' "Dictate" button (see `gui/dashboard.py`'s
+    `_DictationMixin`) so a prompt can be spoken instead of typed. Distinct
+    from `CallVoiceCaptureWorker`, which streams continuously and logs every
+    chunk: this records one arbitrary-length take, transcribes it in one pass,
+    and emits the text for the UI to insert.
+
+    Both phases must stay off the GUI thread — `SpeechToText.__init__` loads
+    the whisper model (seconds on first use) and transcription itself is
+    CPU-bound.
+    """
+
+    finished_ok = pyqtSignal(str)
+    status = pyqtSignal(str)  # e.g. "Transcribing..." once recording stops
+    error = pyqtSignal(str)
+
+    # How long each read_available() poll waits before re-checking
+    # `_recording`, i.e. the worst-case lag between the user clicking "Stop"
+    # and recording actually ending.
+    _POLL_SECONDS = 0.1
+
+    def __init__(self, audio_cfg: dict, speech_cfg: dict, parent=None):
+        super().__init__(parent)
+        self._audio_cfg = audio_cfg
+        self._speech_cfg = speech_cfg
+        self._recording = True
+
+    def stop_recording(self) -> None:
+        """Ends the recording; the thread then transcribes and emits."""
+        self._recording = False
+
+    def run(self) -> None:
+        capture = None
+        try:
+            capture = AudioCapture(**self._audio_cfg)
+            capture.start()
+            blocks = []
+            while self._recording:
+                block = capture.read_available(timeout=self._POLL_SECONDS)
+                if block is not None:
+                    blocks.append(block)
+            capture.stop()
+            # Whatever the callback queued between the last poll and stop() —
+            # dropping it would clip the end of the user's sentence.
+            while True:
+                block = capture.read_available(timeout=0.0)
+                if block is None:
+                    break
+                blocks.append(block)
+
+            if not blocks:
+                self.error.emit("No audio captured — check the microphone and audio.device_index.")
+                return
+
+            self.status.emit("Transcribing...")
+            stt = SpeechToText(**self._speech_cfg)
+            segments = stt.transcribe_chunk(
+                np.concatenate(blocks, axis=0), sample_rate=self._audio_cfg.get("sample_rate", 16000)
+            )
+            self.finished_ok.emit(" ".join(s.text.strip() for s in segments if s.text.strip()))
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            if capture is not None:
+                capture.stop()  # idempotent — safe even if stop() already ran above
+
+
+class ChatWorker(QThread):
+    """Runs one streaming ChatEngine.ask() call off the GUI thread.
+
+    One-shot like SummarizeWorker, but forwards each chunk as it arrives via
+    `chunk_ready` instead of waiting for the full answer. `stop()` doesn't
+    (can't) kill a mid-flight HTTP read outright, but closes the underlying
+    generator on the next chunk boundary so no further chunks are emitted and
+    the partial answer still gets recorded to history (see
+    `assistant.chat_engine.ChatEngine.ask`'s `finally` block).
+    """
+
+    chunk_ready = pyqtSignal(str)
+    finished_ok = pyqtSignal(list)  # citations
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        chat_engine,
+        question: str,
+        project: str | None = None,
+        model: str | None = None,
+        free_chat: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._chat_engine = chat_engine
+        self._question = question
+        self._project = project
+        self._model = model
+        self._free_chat = free_chat
+        self._cancelled = False
+
+    def stop(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            stream = self._chat_engine.ask(
+                self._question, project=self._project, model=self._model, free_chat=self._free_chat
+            )
+            for chunk in stream:
+                if self._cancelled:
+                    stream.close()
+                    break
+                self.chunk_ready.emit(chunk)
+            self.finished_ok.emit(self._chat_engine.last_citations)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class SuggestedQuestionsWorker(QThread):
+    """Runs one ChatEngine.suggested_questions() call off the GUI thread.
+
+    One-shot, like SummarizeWorker. Unlike the old rule-based version, this
+    can now call the local LLM (to ground questions in today's actual
+    captured content), which — same as Summarize's first call after Ollama
+    starts — can take a real amount of time, so it must not run on the GUI
+    thread. Cached per-day by ChatEngine/EventStore, so this only actually
+    hits Ollama once per day in practice.
+    """
+
+    finished_ok = pyqtSignal(list)  # questions
+    error = pyqtSignal(str)
+
+    def __init__(self, chat_engine, parent=None):
+        super().__init__(parent)
+        self._chat_engine = chat_engine
+
+    def run(self) -> None:
+        try:
+            questions = self._chat_engine.suggested_questions()
+            self.finished_ok.emit(questions)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class PlanWorker(QThread):
+    """Runs one generate_plan() call off the GUI thread — see assistant/coding_agent.py.
+
+    One-shot like SummarizeWorker: reads the project's files and makes one
+    (larger, slower) Ollama call, so this must not block the GUI thread.
+    """
+
+    finished_ok = pyqtSignal(object)  # PlanResult
+    error = pyqtSignal(str)
+
+    def __init__(
+        self,
+        project_path: str,
+        issue: str,
+        captured_context: str,
+        plan_cfg: dict,
+        previous_plan: str | None = None,
+        feedback: str | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._project_path = project_path
+        self._issue = issue
+        self._captured_context = captured_context
+        self._plan_cfg = plan_cfg
+        self._previous_plan = previous_plan
+        self._feedback = feedback
+
+    def run(self) -> None:
+        try:
+            plan = generate_plan(
+                self._project_path,
+                self._issue,
+                self._captured_context,
+                previous_plan=self._previous_plan,
+                feedback=self._feedback,
+                **self._plan_cfg,
+            )
+            self.finished_ok.emit(plan)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class ApplyWorker(QThread):
+    """Runs one apply_plan() call off the GUI thread — see assistant/coding_agent.py.
+
+    This is the step that actually writes files (on a new git branch) and
+    can involve several sequential Ollama calls (one per changed file), so it
+    can take a while — must run off the GUI thread same as PlanWorker.
+    """
+
+    finished_ok = pyqtSignal(object)  # ApplyResult
+    error = pyqtSignal(str)
+
+    def __init__(self, project_path: str, plan, issue: str, ollama_cfg: dict, parent=None):
+        super().__init__(parent)
+        self._project_path = project_path
+        self._plan = plan
+        self._issue = issue
+        self._ollama_cfg = ollama_cfg
+
+    def run(self) -> None:
+        try:
+            result = apply_plan(self._project_path, self._plan, self._issue, **self._ollama_cfg)
+            self.finished_ok.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class DevServerWorker(QThread):
+    """Detects a project's dev-server start command, launches it, and opens
+    the result in Chrome — see assistant/dev_server.py.
+
+    The launched process is intentionally left running when this worker
+    finishes; the Code tab keeps the `LaunchResult.process` handle and owns
+    stopping it (via its "Stop Dev Server" button and `shutdown()`).
+    """
+
+    finished_ok = pyqtSignal(object)  # LaunchResult
+    no_start_command = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, project_path: str, timeout_seconds: float = 20.0, parent=None):
+        super().__init__(parent)
+        self._project_path = project_path
+        self._timeout = timeout_seconds
+
+    def run(self) -> None:
+        try:
+            command = detect_start_command(self._project_path)
+            if command is None:
+                self.no_start_command.emit()
+                return
+            result = launch_and_open_chrome(self._project_path, command, timeout=self._timeout)
+            self.finished_ok.emit(result)
         except Exception as exc:
             self.error.emit(str(exc))
 

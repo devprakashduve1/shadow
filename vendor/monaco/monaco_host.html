@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<!--
+  Host page for the Code tab's Monaco editor (gui/ide/monaco.py).
+
+  This file deliberately lives NEXT TO the vendored `vs/` directory rather than
+  in gui/ide/assets/, so `<script src="vs/loader.js">` and Monaco's own internal
+  relative requires resolve with no path rewriting. It is loaded with
+  QWebEngineView.load(QUrl.fromLocalFile(...)) — never setHtml(), which would
+  make the page's base URL something that can't reach `vs/` at all.
+
+  qwebchannel.js is NOT included here: Python injects it as a QWebEngineScript
+  at DocumentCreation, read out of Qt's resource system. See MonacoEditor.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Editor</title>
+    <style>
+      html, body, #container { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; }
+      body { background: #1e1e1e; }
+      /* Shown only if Monaco never finishes loading, so the failure isn't a blank page. */
+      #fallback {
+        color: #cccccc; font: 13px -apple-system, sans-serif; padding: 16px; display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="container"></div>
+    <div id="fallback"></div>
+
+    <script>
+      // Monaco normally spawns web workers for tokenization and language
+      // services. Chromium blocks worker creation from file:// origins, so
+      // without this Monaco throws and the editor never appears. Returning a
+      // data: URL makes Monaco fall back to running everything on the main
+      // thread, which is fine for highlighting + editing. If richer TS/JSON
+      // language services are ever wanted, serve this page over a custom
+      // QWebEngineUrlScheme instead and delete this shim.
+      window.MonacoEnvironment = {
+        getWorkerUrl: function () {
+          return "data:text/javascript;charset=utf-8,";
+        },
+      };
+
+      // Queue of calls that arrive from Python before Monaco has finished
+      // loading. Python also queues on its side (see MonacoEditor._pending_ops);
+      // this covers the narrower window where the page is up but AMD hasn't
+      // resolved editor.main yet.
+      window.__shadowPending = [];
+      window.__shadowReady = false;
+
+      function shadowApply(fn) {
+        if (window.__shadowReady) { fn(); } else { window.__shadowPending.push(fn); }
+      }
+
+      function showFallback(message) {
+        var el = document.getElementById("fallback");
+        el.style.display = "block";
+        el.textContent = message;
+      }
+    </script>
+
+    <script src="vs/loader.js"></script>
+
+    <script>
+      if (typeof require === "undefined") {
+        showFallback(
+          "Could not load vs/loader.js. Run: python scripts/fetch_monaco.py"
+        );
+      } else {
+        // loader.js defaults its `vs` path to a CDN; point it at the sibling
+        // directory so nothing is fetched from the network.
+        require.config({ paths: { vs: "vs" } });
+
+        require(["vs/editor/editor.main"], function () {
+          window.editor = monaco.editor.create(document.getElementById("container"), {
+            value: "",
+            language: "plaintext",
+            theme: "vs-dark",
+            automaticLayout: true,
+            minimap: { enabled: true },
+            scrollBeyondLastLine: false,
+            fontSize: 13,
+            renderWhitespace: "selection",
+          });
+
+          // --- Python -> JS entry points -------------------------------------
+          // Kept deliberately few: everything Python needs goes through these,
+          // so the untested JS surface stays small.
+
+          window.shadowSetContent = function (text, language) {
+            var model = window.editor.getModel();
+            // setValue() would push an undo entry and reset the cursor; for a
+            // fresh file that's what we want, and callers only use this on open.
+            window.__shadowSuppressChange = true;
+            model.setValue(text);
+            monaco.editor.setModelLanguage(model, language || "plaintext");
+            window.__shadowSuppressChange = false;
+          };
+
+          window.shadowGetContent = function () {
+            return window.editor.getModel().getValue();
+          };
+
+          window.shadowSetReadOnly = function (readOnly) {
+            window.editor.updateOptions({ readOnly: !!readOnly });
+          };
+
+          window.shadowSetTheme = function (theme) {
+            monaco.editor.setTheme(theme);
+          };
+
+          window.shadowRevealLine = function (line) {
+            window.editor.revealLineInCenter(line);
+            window.editor.setPosition({ lineNumber: line, column: 1 });
+          };
+
+          // --- JS -> Python notifications ------------------------------------
+
+          var changeTimer = null;
+          window.editor.onDidChangeModelContent(function () {
+            if (window.__shadowSuppressChange) { return; }
+            // Debounced: a keystroke-rate signal across the WebChannel would
+            // flood the Python side for no benefit — the UI only needs to know
+            // "this buffer is now dirty".
+            if (changeTimer) { clearTimeout(changeTimer); }
+            changeTimer = setTimeout(function () {
+              changeTimer = null;
+              if (window.bridge) { window.bridge.contentChanged(); }
+            }, 250);
+          });
+
+          window.editor.onDidChangeCursorPosition(function (e) {
+            if (window.bridge) {
+              window.bridge.cursorMoved(e.position.lineNumber, e.position.column);
+            }
+          });
+
+          window.editor.onDidChangeCursorSelection(function () {
+            if (!window.bridge) { return; }
+            var sel = window.editor.getSelection();
+            var text = window.editor.getModel().getValueInRange(sel);
+            window.bridge.selectionChanged(text, sel.startLineNumber, sel.endLineNumber);
+          });
+
+          // Drain anything queued while loading, then tell Python we're live.
+          window.__shadowReady = true;
+          window.__shadowPending.forEach(function (fn) { fn(); });
+          window.__shadowPending = [];
+
+          if (window.bridge) {
+            window.bridge.ready();
+          } else {
+            // The WebChannel handshake below hasn't landed yet; it will call
+            // ready() itself once `window.bridge` exists.
+            window.__shadowReadyPendingBridge = true;
+          }
+        });
+      }
+
+      // WebChannel handshake. qt.webChannelTransport is injected by
+      // QWebEngineView.page().setWebChannel(); qwebchannel.js is injected by
+      // Python at DocumentCreation. No JS -> Python call is legal until this
+      // callback has run.
+      if (typeof QWebChannel !== "undefined" && typeof qt !== "undefined") {
+        new QWebChannel(qt.webChannelTransport, function (channel) {
+          window.bridge = channel.objects.bridge;
+          if (window.__shadowReadyPendingBridge) {
+            window.__shadowReadyPendingBridge = false;
+            window.bridge.ready();
+          }
+        });
+      }
+    </script>
+  </body>
+</html>

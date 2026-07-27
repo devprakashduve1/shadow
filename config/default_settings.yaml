@@ -26,14 +26,21 @@ screen:
   # Case-insensitive substring match against the frontmost process name OR
   # window title (macOS). Whenever a match is frontmost, screen capture,
   # preview, OCR, and session-file creation are all fully paused.
-  # "Shadow" excludes this app's own window AND any Finder/editor/terminal
-  # window showing the Shadow project or output folder, since those windows'
-  # titles also contain "Shadow" (its process name is "python" when
-  # unbundled, but its window title is "Shadow").
+  # NOTE: excluding this app's own window/process, and any Finder/editor/
+  # terminal window whose name starts with "Shadow" (this project's folder,
+  # its own Shadow_*.txt output files), is HARDCODED in
+  # screen/window_watcher.py's is_window_excluded() — it does not depend on
+  # "Shadow" being listed here. Removing it from this list won't re-enable
+  # capturing this app's own window. It's kept here anyway for visibility.
   excluded_apps: ["Claude", "Shadow"]
   # Case-insensitive substring match against the active browser tab's URL
   # (Chrome/Safari only). Same pause behavior as excluded_apps above.
-  excluded_domains: ["vista.adp.com", "mail.google.com", "outlook.office.com", "web.whatsapp.com"]
+  #
+  # These defaults are deliberately generic examples. Add the sites YOU never want
+  # captured — payroll, banking, health, internal admin tools — to
+  # `config/settings.local.yaml`, which is gitignored, rather than editing this
+  # file. Listing them here would publish which services you use.
+  excluded_domains: ["mail.google.com", "outlook.office.com", "web.whatsapp.com"]
   # When true and OCR is enabled, every system-wide mouse click forces an
   # immediate screen capture + OCR pass instead of waiting for the next
   # capture_interval_seconds tick (still skipped while the frontmost window
@@ -90,3 +97,87 @@ summarize:
   base_url: http://localhost:11434
   model: gemma4
   timeout_seconds: 180
+
+# Structured-event store (events/ + database/json_store.py) — plain JSON/JSONL
+# files, no database. Every OCR/speech entry logged via DataLogger is also
+# redacted, classified, and appended here once a MainWindow is constructed
+# with an EventStore — see gui/dashboard.py.
+database:
+  dir: output/events
+
+# Chat Assistant tab (assistant/) — streams answers from a local Ollama model
+# over the events files above, with retrieval + citations. Same Ollama
+# prerequisite as `summarize` above (`ollama serve` + `ollama pull gemma4`).
+assistant:
+  base_url: http://localhost:11434
+  # Preselected model wherever a model can be chosen. The Code tab discovers the
+  # full list from Ollama itself (`/api/tags`) rather than using a fixed list, so
+  # anything you `ollama pull` shows up automatically; this is just the default
+  # selection, and it's also what the Assistant tab uses.
+  model: gemma4
+  # Ollama can expose *cloud* models that run on ollama.com instead of this
+  # machine. They're hidden by default on purpose: Shadow reads your screen and
+  # your source code, and sending that to a third party should be a decision you
+  # make explicitly, not a side effect of picking a name from a dropdown. Set
+  # true to list them (labelled "cloud").
+  allow_remote_models: false
+  # How long to wait for Ollama's model list before falling back to
+  # coding_agent.available_models. Short — the user is waiting on a dropdown.
+  model_list_timeout_seconds: 5.0
+  timeout_seconds: 180
+  retrieval_days: 7
+  max_context_chars: 12000
+
+# "Code" tab — a VS Code-style workspace over one git repository (gui/ide/).
+# The editor (Monaco) and terminal (xterm.js) JavaScript is NOT committed to this
+# repo; fetch it once with `python scripts/fetch_vendor.py` or those panels show
+# instructions instead.
+ide:
+  # Where fetch_vendor.py puts the vendored JavaScript. Relative paths resolve
+  # from the repo root, not the process working directory.
+  monaco_dir: vendor/monaco
+  xterm_dir: vendor/xterm
+  # Any Monaco theme id: vs, vs-dark, hc-black, hc-light.
+  theme: vs-dark
+  # Files bigger than this are refused rather than truncated — opening a
+  # truncated file and saving it would delete the remainder.
+  max_open_file_bytes: 2000000
+
+# Per-repository Knowledge Bank — a cached index of each project the Code tab
+# opens (files, symbols, dependencies, docs), plus optional LLM-written prose
+# summaries. Stored OUTSIDE the repository so indexing never adds untracked
+# files to the user's project. See assistant/knowledge/.
+knowledge_bank:
+  # Where per-repo banks live. Each gets <root>/<name>-<hash-of-path>/ so two
+  # repositories with the same folder name never share one bank.
+  root: ~/Desktop/.shadow
+  # Index on opening a repo. The static index is fast and incremental (only
+  # changed files are re-read), so this is cheap after the first run.
+  auto_index_on_open: true
+  # Ceiling for very large monorepos; past this the index is flagged truncated.
+  max_files: 20000
+  # Files larger than this are indexed but not parsed for symbols — usually
+  # generated code or bundles, where parsing costs a lot and tells us nothing.
+  max_file_bytes: 524288
+  # Plain-text copies of both banks are written here on every index run, next to
+  # the app's dated log folders, so what the AI knows is readable and greppable
+  # without opening JSON in the hidden .shadow directory. These files are derived
+  # output — editing them changes nothing.
+  text_export_dir: ~/Desktop/Shadow/knowledgebank
+
+# The Code tab's "Plan Multi-File Change" / "Apply Plan" / "Run Dev Server" flow
+# — see assistant/coding_agent.py and assistant/dev_server.py. Unlike the tab's
+# single-file AI actions (which edit in place), applying a plan always writes to
+# a brand-new git branch and refuses to run unless the tree is clean.
+coding_agent:
+  max_relevant_files: 6
+  max_file_bytes: 6000
+  dev_server_timeout_seconds: 20
+  # Fallback list, used ONLY when Ollama can't be reached — normally the model
+  # dropdown is populated from `ollama list` (see assistant/ollama_models.py).
+  available_models: ["gemma4", "qwen3.6"]
+  # Plan/Apply calls read whole project files and can involve a large model's
+  # cold load into memory (e.g. qwen3.6 is ~23GB vs gemma4's ~9.6GB), so this
+  # is separate from and larger than assistant.timeout_seconds (used for
+  # interactive chat, where 180s is already a long wait).
+  timeout_seconds: 600

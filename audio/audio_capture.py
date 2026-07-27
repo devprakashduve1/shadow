@@ -61,6 +61,25 @@ class AudioCapture:
             self._stream.close()
             self._stream = None
 
+    def read_available(self, timeout: float = 0.1) -> Optional[np.ndarray]:
+        """Returns the next raw captured block, or None if none arrived in `timeout`.
+
+        The building block `chunks()` is built on, exposed separately for
+        callers that need to stop promptly or keep every last sample:
+        `chunks()` blocks indefinitely waiting for a full chunk (so it can
+        hang after `stop()`, when no more blocks arrive) and discards the
+        trailing partial chunk. Polling this instead lets a caller check its
+        own "still recording?" flag between blocks — see
+        `gui/workers.py`'s `DictationWorker`.
+
+        Block length is whatever the input stream hands the callback, not
+        `chunk_seconds`; concatenate along axis 0 to assemble a recording.
+        """
+        try:
+            return self._queue.get(timeout=max(timeout, 0.0))
+        except queue.Empty:
+            return None
+
     def chunks(self) -> Iterator[np.ndarray]:
         """Yields concatenated float32 audio chunks of ~chunk_seconds each."""
         self.start()

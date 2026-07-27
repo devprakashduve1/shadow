@@ -219,3 +219,16 @@ __marimo__/
 
 # Shadow app-generated logs
 output/
+
+# Personal settings override (config/settings.py deep-merges this over the
+# defaults). This is where site-specific values belong — the domains you never
+# want captured, internal hostnames, your own model choices — so they stay off a
+# public repo. Never commit it.
+# config/settings.local.yaml
+
+# Vendored JavaScript for the Code tab: Monaco (~24MB) and xterm.js (~4MB).
+# Fetched on demand by `python scripts/fetch_vendor.py`, which pins each version
+# and sha256. The *_host.html files next to them ARE committed — those are ours.
+vendor/monaco/vs/
+vendor/xterm/lib/
+vendor/xterm/css/

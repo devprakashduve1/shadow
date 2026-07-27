@@ -72,19 +72,29 @@ def is_window_excluded(
     excluded_apps: List[str],
     excluded_domains: List[str],
 ) -> bool:
-    """Shared exclusion rule used by both screen-capture and spell-check pipelines.
+    """Exclusion rule used by the screen-capture/OCR pipeline (`gui/workers.py`'s
+    `ScreenOcrWorker`). Not used by spell check, which has no exclusions — see
+    README's "Spell check (system-wide)" section.
 
-    Matches (case-insensitively) the frontmost process name/window title
-    against `excluded_apps`, always excludes any window/file titled starting
-    with "Shadow" (this app's own output), and matches the active browser
-    tab URL against `excluded_domains`.
+    Always excludes this app itself and anything named after it — the
+    frontmost app name OR window title starting with "shadow" (case
+    insensitive) — this app's own window, and any Finder/editor/terminal
+    window showing a folder or file whose name starts with "Shadow" (e.g.
+    this project folder, or one of its own `Shadow_*` output files). This
+    check is hardcoded and NOT affected by `excluded_apps`/`config/settings.local.yaml`
+    — removing "Shadow" from your local `excluded_apps` override does not
+    re-enable capturing this app's own window.
+
+    Beyond that, matches (case-insensitively) the frontmost process name/
+    window title against the configurable `excluded_apps`, and the active
+    browser tab URL against `excluded_domains`.
     """
     if window is None:
         return False
     haystacks = [window.app_name.lower(), window.window_title.lower()]
-    if any(pattern.lower() in text for pattern in excluded_apps for text in haystacks):
+    if any(text.startswith("shadow") for text in haystacks if text):
         return True
-    if window.window_title.lower().startswith("shadow"):
+    if any(pattern.lower() in text for pattern in excluded_apps for text in haystacks):
         return True
     if window.url:
         url = window.url.lower()
