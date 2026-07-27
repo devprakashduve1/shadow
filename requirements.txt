@@ -8,9 +8,15 @@ easyocr>=1.7.1
 faster-whisper>=1.0.1
 sounddevice>=0.4.6
 PyQt6>=6.6.1
+# Embeds a Chromium view for the Code tab's Monaco editor (gui/ide/monaco.py).
+# Pulls a ~110MB PyQt6-WebEngine-Qt6 wheel. The qwebchannel.js the editor bridge
+# needs is read from Qt's resource system (":/qtwebchannel/qwebchannel.js"), not
+# from disk — see gui/ide/monaco.py.
+PyQt6-WebEngine>=6.10.0
 numpy>=1.26.4
 pandas>=2.2.1
 PyYAML>=6.0.1
 Pillow>=10.2.0
 pyspellchecker>=0.8.1
 language_tool_python>=2.7.0  # grammar checking; requires a local JRE (see README "Spell check")
+pytest>=8.0.0  # test suite (tests/) — events/database/assistant use only json, pathlib, urllib (all stdlib)

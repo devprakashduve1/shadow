@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QDate, Qt, QTimer
+from PyQt6.QtCore import QDate, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -25,12 +25,24 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from assistant import ChatEngine
 from config import settings
+from database.json_store import EventStore
 from gesture import GestureResult
 from logger import DataLogger
 from search import SearchEngine
 
-from .workers import CallVoiceCaptureWorker, GestureWorker, ScreenOcrWorker, SpellCheckWorker, SummarizeWorker
+from .chat_widgets import ChatInput, _DictationMixin
+from .ide import IDETab
+from .workers import (
+    CallVoiceCaptureWorker,
+    ChatWorker,
+    GestureWorker,
+    ScreenOcrWorker,
+    SpellCheckWorker,
+    SuggestedQuestionsWorker,
+    SummarizeWorker,
+)
 
 
 class SpellSuggestionPopup(QWidget):
@@ -488,6 +500,22 @@ class LiveMonitorTab(QWidget):
         self._stop_call_capture()
         self._stop_spellcheck()
 
+    def is_capturing(self) -> tuple[bool, bool]:
+        """Returns (screen/OCR active, mic/voice active) — MainWindow's consent badge polls this.
+
+        `mic_active` reflects `CallVoiceCaptureWorker.is_recording` — true only
+        while a microphone AudioCapture is actually open, i.e. only during a
+        live-detected huddle/meeting with transcription enabled — never just
+        because call detection is running or the checkbox is on. The mic is
+        never opened outside of a detected call (see
+        `CallVoiceCaptureWorker.run` in `gui/workers.py`); this only makes the
+        badge tell the truth about that, since a worker existing with
+        transcription enabled does not by itself mean audio is being captured.
+        """
+        screen_active = self._screen_worker is not None
+        mic_active = self._call_worker is not None and self._call_worker.is_recording
+        return screen_active, mic_active
+
 
 class SearchTab(QWidget):
     def __init__(self, logger: DataLogger, parent=None):
@@ -621,6 +649,7 @@ class SearchTab(QWidget):
     def _on_summary_ready(self, summary: str) -> None:
         self.summary_output.setPlainText(summary)
         self.summary_status_label.setText("Summary ready.")
+        self._summarize_worker.wait()  # see _StreamingChatMixin's docstring
         self._summarize_worker = None
         self.summarize_btn.setEnabled(True)
         self.summarize_btn.setText("Summarize results")
@@ -628,6 +657,7 @@ class SearchTab(QWidget):
     def _on_summary_error(self, message: str) -> None:
         self.summary_status_label.setText("Error — see details below.")
         self.summary_output.setPlainText(f"Error: {message}")
+        self._summarize_worker.wait()
         self._summarize_worker = None
         self.summarize_btn.setEnabled(True)
         self.summarize_btn.setText("Summarize results")
@@ -639,23 +669,253 @@ class SearchTab(QWidget):
             self._summarize_worker.wait(2000)
 
 
+class _StreamingChatMixin:
+    """Shared chunk/finished/error handling for a QTextEdit-based chat transcript.
+
+    Used by `AssistantTab`, which owns its own `_ask`/`_reset_worker`. Kept as
+    a mixin rather than folded in because the Code tab's AI panel renders
+    streamed chunks the same way (see `gui/ide/ai_panel.py`).
+
+    Assumes the including widget defines `self.transcript` (QTextEdit),
+    `self.status_label` (QLabel), and a `self._reset_worker()` method.
+
+    IMPORTANT pattern followed everywhere a one-shot worker's own
+    `finished_ok`/`error` signal clears its Python reference (here and in
+    every other `_on_..._ready`/`_on_..._error` handler in this file): always
+    call `worker.wait()` immediately before setting the attribute to `None`.
+    A worker's `run()` emits its signal right before returning, but the
+    underlying OS thread may not have fully unwound yet by the time the
+    (queued, cross-thread) signal is delivered here — dropping the last
+    Python reference at that instant can destroy the QThread object while
+    Qt still considers it running, printing "QThread: Destroyed while thread
+    is still running". `wait()` with no args blocks until the thread has
+    truly finished, which by this point is either already true or a matter
+    of microseconds — never a perceptible delay — and closes the race.
+    """
+
+    def _on_chunk(self, chunk: str) -> None:
+        cursor = self.transcript.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self.transcript.setTextCursor(cursor)
+        self.transcript.insertPlainText(chunk)
+
+    def _on_finished(self, citations: list) -> None:
+        if citations:
+            lines = "\n".join(
+                f"  [{c['timestamp']}] ({c['type']}: {c.get('application') or c['source']}) {c['snippet']}"
+                for c in citations
+            )
+            self.transcript.append(f"\nSources:\n{lines}\n")
+        self.status_label.setText("")
+        self._reset_worker()
+
+    def _on_error(self, message: str) -> None:
+        self.transcript.append(f"\n[Error: {message}]\n")
+        self.status_label.setText("Error — see transcript.")
+        self._reset_worker()
+
+
+class AssistantTab(QWidget, _StreamingChatMixin, _DictationMixin):
+    """Chat over the structured events database — see assistant/chat_engine.py.
+
+    Requires the same local Ollama prerequisite as SearchTab's "Summarize
+    results" (`ollama serve` + the configured model pulled); a connection
+    failure surfaces as an inline transcript message rather than a crash.
+    """
+
+    def __init__(self, chat_engine: ChatEngine, parent=None):
+        super().__init__(parent)
+        self._chat_engine = chat_engine
+        self._chat_worker: ChatWorker | None = None
+        self._suggestions_worker: SuggestedQuestionsWorker | None = None
+
+        self.transcript = QTextEdit()
+        self.transcript.setReadOnly(True)
+        self.transcript.setPlaceholderText(
+            'Ask about your captured activity, e.g. "What did I work on today?" '
+            "(config: assistant.model, default gemma4 via Ollama)"
+        )
+
+        self.question_input = ChatInput()
+        self.question_input.setPlaceholderText(
+            "Ask a question about your day... (Enter to send, Shift+Enter for a new line)"
+        )
+        self.question_input.setFixedHeight(70)
+        self.send_btn = QPushButton("Send")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.new_session_btn = QPushButton("New Session")
+        self.status_label = QLabel("")
+        self._build_dictate_button()  # see _DictationMixin
+
+        self.suggestions_row = QHBoxLayout()
+
+        self.question_input.submitted.connect(self._send)
+        self.send_btn.clicked.connect(self._send)
+        self.stop_btn.clicked.connect(self._stop)
+        self.new_session_btn.clicked.connect(self._new_session)
+
+        self._build_layout()
+        self._load_suggested_questions()
+
+    def _build_layout(self) -> None:
+        suggestions_box = QWidget()
+        suggestions_box.setLayout(self.suggestions_row)
+
+        top_row = QHBoxLayout()
+        top_row.addStretch()
+        top_row.addWidget(self.new_session_btn)
+
+        input_row = QHBoxLayout()
+        input_row.addWidget(self.question_input)
+        input_row.addWidget(self.dictate_btn)
+        input_row.addWidget(self.send_btn)
+        input_row.addWidget(self.stop_btn)
+
+        root = QVBoxLayout()
+        root.addLayout(top_row)
+        root.addWidget(self.transcript)
+        root.addWidget(suggestions_box)
+        root.addLayout(input_row)
+        root.addWidget(self.status_label)
+        self.setLayout(root)
+
+    def _load_suggested_questions(self) -> None:
+        if self._suggestions_worker is not None:
+            return  # already loading
+        # Generation now calls the local LLM (grounded in today's actual
+        # captured content) rather than picking from fixed templates, so —
+        # same reasoning as SummarizeWorker/ChatWorker — this must run off
+        # the GUI thread; it can take a real amount of time, especially the
+        # first Ollama call after (re)start.
+        self.status_label.setText("Loading suggested questions...")
+        self._suggestions_worker = SuggestedQuestionsWorker(self._chat_engine)
+        self._suggestions_worker.finished_ok.connect(self._on_suggestions_ready)
+        self._suggestions_worker.error.connect(self._on_suggestions_error)
+        self._suggestions_worker.start()
+
+    def _on_suggestions_ready(self, questions: list) -> None:
+        for question in questions:
+            btn = QPushButton(question)
+            btn.clicked.connect(lambda _checked=False, q=question: self._ask(q))
+            self.suggestions_row.addWidget(btn)
+        self.status_label.setText("")
+        self._suggestions_worker.wait()  # see _StreamingChatMixin's docstring
+        self._suggestions_worker = None
+
+    def _on_suggestions_error(self, message: str) -> None:
+        self.status_label.setText(f"Could not load suggested questions: {message}")
+        self._suggestions_worker.wait()
+        self._suggestions_worker = None
+
+    def _send(self) -> None:
+        question = self.question_input.toPlainText().strip()
+        if not question:
+            return
+        self.question_input.clear()
+        self._ask(question)
+
+    def _new_session(self) -> None:
+        """Clears this tab's visible transcript and its persisted conversation
+        history (`ChatEngine.new_session()`) so the next question starts fresh
+        with no prior turns carried into context."""
+        if self._chat_worker is not None:
+            return  # don't reset mid-answer
+        self.transcript.clear()
+        self._chat_engine.new_session()
+        self.status_label.setText("Started a new session — previous chat history cleared.")
+
+    def _ask(self, question: str) -> None:
+        if self._chat_worker is not None:
+            return  # a question is already in flight
+        self.transcript.append(f"\nYou: {question}\n")
+        self.transcript.insertPlainText("Shadow: ")
+        self.send_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.new_session_btn.setEnabled(False)
+        self.status_label.setText("Thinking...")
+
+        self._chat_worker = ChatWorker(self._chat_engine, question)
+        self._chat_worker.chunk_ready.connect(self._on_chunk)
+        self._chat_worker.finished_ok.connect(self._on_finished)
+        self._chat_worker.error.connect(self._on_error)
+        self._chat_worker.start()
+
+    def _stop(self) -> None:
+        if self._chat_worker is not None:
+            self._chat_worker.stop()
+            self.status_label.setText("Stopping...")
+
+    def _reset_worker(self) -> None:
+        self._chat_worker.wait()  # see _StreamingChatMixin's docstring
+        self._chat_worker = None
+        self.send_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.new_session_btn.setEnabled(True)
+
+    def shutdown(self) -> None:
+        if self._chat_worker is not None:
+            self._chat_worker.stop()
+            self._chat_worker.wait(2000)
+        if self._suggestions_worker is not None:
+            self._suggestions_worker.wait(2000)
+        self._shutdown_dictation()  # releases the mic if a recording is in flight
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Shadow")
         self.resize(900, 650)
 
-        self._logger = DataLogger(base_dir=settings.get("logging.base_dir", "output/logs"))
+        self._event_store = EventStore(base_dir=settings.get("database.dir", "output/events"))
+        self._logger = DataLogger(
+            base_dir=settings.get("logging.base_dir", "output/logs"),
+            event_store=self._event_store,
+        )
+        self._chat_engine = ChatEngine.from_settings(self._event_store, settings)
 
         self.live_tab = LiveMonitorTab(self._logger)
         self.search_tab = SearchTab(self._logger)
+        self.assistant_tab = AssistantTab(self._chat_engine)
+        self.ide_tab = IDETab(self._chat_engine, self._event_store)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.live_tab, "Live Monitor")
         self.tabs.addTab(self.search_tab, "Search")
+        self.tabs.addTab(self.assistant_tab, "Assistant")
+        # Replaced the old "Coding Agent" tab: same plan/apply, dev-server,
+        # model picker and dictation, plus an editor, file tree, git status, and
+        # per-file AI edits with diff review.
+        self.tabs.addTab(self.ide_tab, "Code")
         self.setCentralWidget(self.tabs)
+
+        # Consent badge: an always-visible "what's currently being captured"
+        # indicator, polling LiveMonitorTab's existing worker state rather than
+        # adding new capture behavior — the checkboxes on that tab remain the
+        # actual consent mechanism.
+        self._consent_label = QLabel()
+        self.statusBar().addPermanentWidget(self._consent_label)
+        self._consent_timer = QTimer(self)
+        self._consent_timer.timeout.connect(self._update_consent_badge)
+        self._consent_timer.start(2000)
+        self._update_consent_badge()
+
+    def _update_consent_badge(self) -> None:
+        screen_active, mic_active = self.live_tab.is_capturing()
+        if screen_active and mic_active:
+            text = "● Recording: screen+OCR, mic"
+        elif screen_active:
+            text = "● Recording: screen+OCR"
+        elif mic_active:
+            text = "● Recording: mic"
+        else:
+            text = "○ Idle — no active capture"
+        self._consent_label.setText(text)
 
     def closeEvent(self, event) -> None:
         self.live_tab.shutdown()
         self.search_tab.shutdown()
+        self.assistant_tab.shutdown()
+        self.ide_tab.shutdown()
         super().closeEvent(event)

@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<!--
+  Host page for the Code tab's terminal (gui/ide/terminal.py).
+
+  Lives next to the vendored lib/ and css/ so relative script tags resolve with
+  no path rewriting, and is loaded via QUrl.fromLocalFile — same constraints as
+  monaco_host.html; see that file for the full reasoning.
+
+  This is a real terminal: keystrokes go to a PTY on the Python side, and the
+  bytes coming back (ANSI escapes and all) are handed to xterm.js, which is an
+  actual terminal emulator. That's why vim, htop, and coloured test output work
+  here where a QProcess-plus-QPlainTextEdit panel would render garbage.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Terminal</title>
+    <link rel="stylesheet" href="css/xterm.css" />
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; overflow: hidden; }
+      #container { height: 100%; width: 100%; padding: 4px; box-sizing: border-box; }
+      #fallback { color: #ccc; font: 13px -apple-system, sans-serif; padding: 16px; display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="container"></div>
+    <div id="fallback"></div>
+
+    <script src="lib/xterm.js"></script>
+    <script src="lib/addon-fit.js"></script>
+
+    <script>
+      function showFallback(message) {
+        var el = document.getElementById("fallback");
+        el.style.display = "block";
+        el.textContent = message;
+      }
+
+      if (typeof Terminal === "undefined") {
+        showFallback("Could not load lib/xterm.js. Run: python scripts/fetch_vendor.py");
+      } else {
+        var term = new Terminal({
+          fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+          fontSize: 12,
+          cursorBlink: true,
+          // Bounded so a chatty build can't grow the buffer without limit.
+          scrollback: 5000,
+          theme: {
+            background: "#1e1e1e",
+            foreground: "#d4d4d4",
+            cursor: "#d4d4d4",
+            selectionBackground: "#264f78",
+          },
+        });
+
+        var fitAddon = null;
+        // The addon's global name has differed between xterm releases; try both
+        // rather than hard-coding whichever this version happens to use.
+        var FitCtor =
+          (window.FitAddon && window.FitAddon.FitAddon) ||
+          (window.addonFit && window.addonFit.FitAddon) ||
+          null;
+        if (FitCtor) {
+          fitAddon = new FitCtor();
+          term.loadAddon(fitAddon);
+        }
+
+        term.open(document.getElementById("container"));
+        window.term = term;
+
+        // Every keystroke goes to the PTY; nothing is echoed locally, because the
+        // shell (or the program running in it) owns echo. Local echo would double
+        // every character and break anything using raw mode.
+        term.onData(function (data) {
+          if (window.bridge) { window.bridge.input(data); }
+        });
+
+        // --- Python -> JS -------------------------------------------------
+
+        window.shadowWrite = function (data) { term.write(data); };
+        window.shadowClear = function () { term.clear(); };
+        window.shadowFocus = function () { term.focus(); };
+
+        // Returns the new size so Python can push it to the PTY via TIOCSWINSZ —
+        // without that, programs like vim and less keep drawing at the old size.
+        window.shadowFit = function () {
+          if (fitAddon) { try { fitAddon.fit(); } catch (e) {} }
+          return JSON.stringify({ cols: term.cols, rows: term.rows });
+        };
+
+        function reportResize() {
+          if (window.bridge) { window.bridge.resized(term.cols, term.rows); }
+        }
+        term.onResize(reportResize);
+
+        var resizeTimer = null;
+        window.addEventListener("resize", function () {
+          if (resizeTimer) { clearTimeout(resizeTimer); }
+          resizeTimer = setTimeout(function () {
+            resizeTimer = null;
+            if (fitAddon) { try { fitAddon.fit(); } catch (e) {} }
+            reportResize();
+          }, 120);
+        });
+
+        window.__shadowReady = true;
+        if (window.bridge) {
+          window.bridge.ready();
+        } else {
+          window.__shadowReadyPendingBridge = true;
+        }
+      }
+
+      if (typeof QWebChannel !== "undefined" && typeof qt !== "undefined") {
+        new QWebChannel(qt.webChannelTransport, function (channel) {
+          window.bridge = channel.objects.bridge;
+          if (window.__shadowReadyPendingBridge) {
+            window.__shadowReadyPendingBridge = false;
+            window.bridge.ready();
+          }
+        });
+      }
+    </script>
+  </body>
+</html>

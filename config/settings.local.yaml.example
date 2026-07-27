@@ -1,0 +1,27 @@
+# Copy to `config/settings.local.yaml` (gitignored) and edit.
+#
+# `config/settings.py` deep-merges this file over `default_settings.yaml`, so you
+# only need the keys you want to change. This is the right home for anything
+# site-specific or sensitive — it never gets committed.
+
+screen:
+  # Sites that should never be captured. Substring match against the active
+  # browser tab's URL; whenever one matches, screen capture, OCR, and preview
+  # all pause. Add your payroll, banking, health, and internal admin tools.
+  excluded_domains:
+    - mail.google.com
+    - outlook.office.com
+    - web.whatsapp.com
+    # - payroll.example.com
+    # - admin.internal.example.com
+
+  # Apps that should never be captured, matched against the frontmost process
+  # name or window title.
+  excluded_apps:
+    - Claude
+    - Shadow
+    # - 1Password
+
+assistant:
+  # Preselected model. The Code tab lists whatever Ollama has installed.
+  model: gemma4
