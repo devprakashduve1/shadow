@@ -19,7 +19,10 @@ from logger import DataLogger, LogEntry
 from mouse import MouseController
 from ocr import OCREngine
 from screen import ScreenCapture, get_frontmost_window, is_window_excluded
-from speech import SpeechToText
+from speech import LiveTranscriber, SegmenterConfig, SpeechToText
+from speech.speech_to_text import WHISPER_SAMPLE_RATE
+
+from .progress import Stage
 from spellcheck import GrammarChecker, SpellChecker
 from summarize import LogSummarizer
 
@@ -102,6 +105,9 @@ class CallVoiceCaptureWorker(QThread):
         # not just configuration, so UI indicators (MainWindow's consent
         # badge) don't claim the mic is recording when it isn't.
         self.is_recording = False
+        # Held so `stop()` can close the device from the GUI thread; without it a
+        # stop lands while this thread is mid-chunk and the mic stays open.
+        self._capture: AudioCapture | None = None
 
     def run(self) -> None:
         self._running = True
@@ -128,6 +134,7 @@ class CallVoiceCaptureWorker(QThread):
                     self._logger.start_session("speech", f"meeting_{state.source}")
                     self.status_changed.emit(f"Recording ({state.source}): {state.label}")
                     capture = AudioCapture(**self._audio_cfg)
+                    self._capture = capture
                     chunk_iter = capture.chunks()
                     if stt is None:
                         stt = SpeechToText(**self._speech_cfg)
@@ -137,6 +144,7 @@ class CallVoiceCaptureWorker(QThread):
                     # by transcription being toggled off mid-call.
                     capture.stop()
                     capture = None
+                    self._capture = None
                     chunk_iter = None
                     current_source = ""
                     self.is_recording = False
@@ -148,22 +156,38 @@ class CallVoiceCaptureWorker(QThread):
                     self.status_changed.emit(f"Call detected ({state.source}) — transcription disabled")
 
                 if capture is not None and chunk_iter is not None and stt is not None:
-                    chunk = next(chunk_iter)
+                    # None means the capture ended underneath us (a stop from
+                    # another thread); loop round so `_running` decides what next.
+                    chunk = next(chunk_iter, None)
+                    if chunk is None:
+                        capture = None
+                        self._capture = None
+                        chunk_iter = None
+                        self.is_recording = False
+                        continue
                     for seg in stt.transcribe_chunk(chunk, sample_rate=self._audio_cfg.get("sample_rate", 16000)):
                         self._logger.log_transcript(seg.text, extra={"source_app": current_source})
                         self.transcript_ready.emit(current_source, seg.text)
                 else:
                     time.sleep(self._poll_interval)
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
             if capture is not None:
                 capture.stop()
+            self._capture = None
             self.is_recording = False
 
     def stop(self) -> None:
         self._running = False
-        self.wait(2000)
+        # Close the device first: this thread may be blocked part-way through
+        # assembling a chunk, and `chunks()` only notices the stop once the
+        # stream is gone. Without this the wait below times out and the thread
+        # lingers with the microphone still open.
+        capture = self._capture
+        if capture is not None:
+            capture.stop()
+        self.wait(5000)
 
 
 class ScreenOcrWorker(QThread):
@@ -454,6 +478,7 @@ class DictationWorker(QThread):
 
     finished_ok = pyqtSignal(str)
     status = pyqtSignal(str)  # e.g. "Transcribing..." once recording stops
+    stage = pyqtSignal(str)  # a `gui.progress.Stage`, for the progress indicator
     error = pyqtSignal(str)
 
     # How long each read_available() poll waits before re-checking
@@ -476,6 +501,7 @@ class DictationWorker(QThread):
         try:
             capture = AudioCapture(**self._audio_cfg)
             capture.start()
+            self.stage.emit(Stage.LISTENING)
             blocks = []
             while self._recording:
                 block = capture.read_available(timeout=self._POLL_SECONDS)
@@ -491,20 +517,143 @@ class DictationWorker(QThread):
                 blocks.append(block)
 
             if not blocks:
-                self.error.emit("No audio captured — check the microphone and audio.device_index.")
+                # The stream opened without error (device.start() would have raised
+                # otherwise) but delivered nothing — PortAudio doesn't raise when
+                # macOS silently denies microphone access, so this is the most
+                # common real-world cause, not a code bug.
+                device = capture.resolved_device_name or "the selected input device"
+                self.error.emit(
+                    f"No audio captured from {device} — check that this app has microphone "
+                    "permission (macOS: System Settings > Privacy & Security > Microphone) "
+                    "and that audio.device_index points at a working input device."
+                )
                 return
 
             self.status.emit("Transcribing...")
+            self.stage.emit(Stage.TRANSCRIBING)
             stt = SpeechToText(**self._speech_cfg)
             segments = stt.transcribe_chunk(
                 np.concatenate(blocks, axis=0), sample_rate=self._audio_cfg.get("sample_rate", 16000)
             )
             self.finished_ok.emit(" ".join(s.text.strip() for s in segments if s.text.strip()))
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error.emit(f"{type(exc).__name__}: {exc}")
         finally:
             if capture is not None:
                 capture.stop()  # idempotent — safe even if stop() already ran above
+
+
+class LiveDictationWorker(QThread):
+    """Transcribes the microphone continuously, emitting text as it's spoken.
+
+    The streaming counterpart to `DictationWorker`: rather than one transcription
+    after the user stops, `speech.LiveTranscriber` cuts the audio at pauses and
+    transcribes each utterance as it completes, so text appears while they're
+    still talking.
+
+    Two signals because live results come in two flavours (see
+    `speech.live_transcriber`): `partial_ready` is a revisable reading of the
+    sentence in progress and each one replaces the last, while `final_ready` is
+    settled text the UI can commit.
+    """
+
+    partial_ready = pyqtSignal(str)  # interim — supersedes the previous partial
+    final_ready = pyqtSignal(str)  # settled text for the UI to keep
+    status = pyqtSignal(str)
+    stage = pyqtSignal(str)  # a `gui.progress.Stage`, for the progress indicator
+    error = pyqtSignal(str)
+
+    _POLL_SECONDS = 0.1
+
+    def __init__(self, audio_cfg: dict, speech_cfg: dict, live_cfg: Optional[dict] = None, parent=None):
+        super().__init__(parent)
+        self._audio_cfg = audio_cfg
+        self._speech_cfg = speech_cfg
+        self._live_cfg = live_cfg or {}
+        self._recording = True
+        self._capture: Optional[AudioCapture] = None
+        self._heard_audio = False
+        # Mirrors CallVoiceCaptureWorker's flag so MainWindow's consent badge can
+        # tell the truth about the microphone being open (see
+        # `LiveMonitorTab.is_capturing`).
+        self.is_recording = False
+
+    def stop_recording(self) -> None:
+        """Ends the recording; any final utterance is flushed before finishing."""
+        self._recording = False
+        capture = self._capture
+        if capture is not None:
+            # Unblocks the poll immediately rather than waiting out its timeout.
+            capture.stop()
+
+    def run(self) -> None:
+        capture = None
+        try:
+            # Loaded before the stream opens, not after: the model takes seconds
+            # on first use, and audio captured during that wait would pile up in
+            # the queue and be transcribed as one late backlog.
+            self.status.emit("Preparing speech model...")
+            self.stage.emit(Stage.LOADING_MODEL)
+            stt = SpeechToText(**self._speech_cfg)
+
+            sample_rate = self._audio_cfg.get("sample_rate", WHISPER_SAMPLE_RATE)
+            live = LiveTranscriber(
+                stt,
+                segmenter_config=SegmenterConfig(
+                    sample_rate=sample_rate,
+                    silence_seconds=self._live_cfg.get("silence_seconds", 0.8),
+                    max_utterance_seconds=self._live_cfg.get("max_utterance_seconds", 20.0),
+                ),
+                interim_interval_seconds=self._live_cfg.get("interim_interval_seconds", 1.5),
+                sample_rate=sample_rate,
+            )
+
+            capture = AudioCapture(**self._audio_cfg)
+            self._capture = capture
+            capture.start()
+            self.is_recording = True
+            self.stage.emit(Stage.LISTENING)
+            self.status.emit("Listening — speak now, then click again to finish.")
+
+            while self._recording:
+                block = capture.read_available(timeout=self._POLL_SECONDS)
+                if block is None:
+                    continue
+                self._heard_audio = True
+                self._emit(live.push(block))
+
+            capture.stop()
+            # Blocks queued between the last poll and the stop, which would
+            # otherwise clip the end of the closing sentence.
+            while True:
+                block = capture.read_available(timeout=0.0)
+                if block is None:
+                    break
+                self._heard_audio = True
+                self._emit(live.push(block))
+            self._emit(live.flush())
+
+            if not self._heard_audio:
+                device = capture.resolved_device_name or "the selected input device"
+                self.error.emit(
+                    f"No audio captured from {device} — check that this app has microphone "
+                    "permission (macOS: System Settings > Privacy & Security > Microphone) "
+                    "and that audio.device_index points at a working input device."
+                )
+        except Exception as exc:
+            self.error.emit(f"{type(exc).__name__}: {exc}")
+        finally:
+            self.is_recording = False
+            self._capture = None
+            if capture is not None:
+                capture.stop()  # idempotent
+
+    def _emit(self, results) -> None:
+        for result in results:
+            if result.is_final:
+                self.final_ready.emit(result.text)
+            else:
+                self.partial_ready.emit(result.text)
 
 
 class ChatWorker(QThread):

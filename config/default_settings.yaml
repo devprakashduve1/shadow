@@ -64,6 +64,20 @@ speech:
   engine: faster-whisper
   model_size: base
   language: en
+  # Live dictation: transcribe while the user speaks rather than once at the end.
+  live:
+    # Set false to fall back to record-then-transcribe, which does less work on a
+    # slow machine (no re-transcribing the sentence in progress).
+    enabled: true
+    # How much new speech to accumulate before refreshing the interim text.
+    # Lower feels more responsive and costs proportionally more CPU; 0 disables
+    # interim results, leaving only the text settled at each pause.
+    interim_interval_seconds: 1.5
+    # Silence that marks the end of an utterance. Long enough to ride out a
+    # mid-sentence breath.
+    silence_seconds: 0.8
+    # Hard cut for continuous speech with no pause, so text keeps arriving.
+    max_utterance_seconds: 20.0
 
 callwatch:
   poll_interval_seconds: 3.0
@@ -124,6 +138,13 @@ assistant:
   # How long to wait for Ollama's model list before falling back to
   # coding_agent.available_models. Short — the user is waiting on a dropdown.
   model_list_timeout_seconds: 5.0
+  # Keep the model resident between requests instead of letting Ollama evict it
+  # after five idle minutes. A large model costs tens of seconds to load, and
+  # paying that repeatedly is the main reason the assistant feels slow. The
+  # trade-off is that the model holds its memory (often several GB) until the AI
+  # panel's "Unload Model" button releases it, or Ollama exits. Set false to
+  # return to Ollama's own idle eviction.
+  keep_model_loaded: true
   timeout_seconds: 180
   retrieval_days: 7
   max_context_chars: 12000

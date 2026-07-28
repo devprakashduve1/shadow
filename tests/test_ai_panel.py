@@ -127,15 +127,16 @@ def test_calling_send_directly_with_no_text_explains_itself(panel) -> None:
     assert "Type something first" in panel.status_label.text()
 
 
-def test_send_emits_implement_with_the_instruction(panel) -> None:
+def test_send_with_project_context_emits_prompt_submitted(panel) -> None:
+    """Send no longer needs a mode choice; the tab infers intent from the prompt."""
     panel.set_active_file("app.py")
     panel.prompt_input.setPlainText("add a --dry-run flag")
     seen = []
-    panel.action_requested.connect(lambda action, instruction: seen.append((action, instruction)))
+    panel.prompt_submitted.connect(seen.append)
 
     panel.send_btn.click()
 
-    assert seen == [(EditAction.IMPLEMENT, "add a --dry-run flag")]
+    assert seen == ["add a --dry-run flag"]
 
 
 def test_build_request_carries_the_panel_context(panel) -> None:
@@ -320,17 +321,18 @@ def test_send_with_no_file_asks_a_general_question(panel) -> None:
     assert edits == [], "no file open, so this must not become an edit request"
 
 
-def test_send_with_a_file_open_requests_an_edit(panel) -> None:
+def test_send_with_a_file_open_is_not_a_general_question(panel) -> None:
+    """An open file means project context exists, so the prompt is routed for
+    intent classification rather than answered as a context-free question."""
     panel.set_active_file("app.py")
-    asked = []
-    edits = []
+    asked, routed = [], []
     panel.general_chat_requested.connect(asked.append)
-    panel.action_requested.connect(lambda a, i: edits.append((a, i)))
+    panel.prompt_submitted.connect(routed.append)
     panel.prompt_input.setPlainText("add a docstring")
 
     panel.send_btn.click()
 
-    assert edits == [(EditAction.IMPLEMENT, "add a docstring")]
+    assert routed == ["add a docstring"]
     assert asked == []
 
 
@@ -425,3 +427,63 @@ def test_refresh_models_button_emits(panel) -> None:
     panel.refresh_models_btn.click()
 
     assert seen == [True]
+
+
+# -- prompt routing (mode picker removed — the tab classifies intent) --------
+#
+# The explicit Plan/Discussion/Code Fix radio picker is gone; AIPanel just
+# forwards any prompt with project context via `prompt_submitted`, and
+# `gui.ide.tab._classify_intent` (tested separately in
+# tests/test_intent_classification.py) decides what to do with it. These tests
+# cover only what AIPanel itself still owns: that project context is required
+# for send to be meaningful, and that no mode gate blocks it anymore.
+
+
+def test_send_no_longer_requires_a_mode_choice(panel) -> None:
+    panel.set_project_open(True)
+    panel.prompt_input.setPlainText("make it faster")
+
+    assert panel.send_btn.isEnabled() is True
+
+
+def test_send_with_project_context_and_no_file_still_routes_via_prompt_submitted(panel) -> None:
+    """Code Fix used to require an open file; now nothing does — the AI resolves
+    the target from the Knowledge Bank when none is open."""
+    panel.set_project_open(True)
+    panel.prompt_input.setPlainText("charges are off by a cent")
+    routed = []
+    panel.prompt_submitted.connect(routed.append)
+
+    panel.send_btn.click()
+
+    assert routed == ["charges are off by a cent"]
+
+
+def test_with_no_repository_send_falls_back_to_a_plain_question(panel) -> None:
+    """The panel stays useful before a project is chosen."""
+    panel.set_project_open(False)
+    asked, routed = [], []
+    panel.general_chat_requested.connect(asked.append)
+    panel.prompt_submitted.connect(routed.append)
+    panel.prompt_input.setPlainText("what is a generator?")
+
+    panel.send_btn.click()
+
+    assert asked == ["what is a generator?"]
+    assert routed == []
+
+
+def test_build_request_leaves_the_path_empty_with_no_file(panel) -> None:
+    """An empty rel_path is the signal for `propose_edit` to choose a target."""
+    panel.set_project_open(True)
+
+    request = panel.build_request("/tmp/proj", EditAction.IMPLEMENT, "fix charges")
+
+    assert request.rel_path == ""
+
+
+def test_context_label_says_the_ai_will_choose(panel) -> None:
+    panel.set_project_open(True)
+    panel.set_active_file(None)
+
+    assert "choose which file" in panel.context_label.text()

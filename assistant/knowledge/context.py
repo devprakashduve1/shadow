@@ -104,7 +104,7 @@ def _score_entry(entry: FileEntry, keywords: Sequence[str]) -> Tuple[float, List
         if keyword in path_lower:
             score += _WEIGHT_PATH
         for symbol in entry.symbols:
-            if keyword in symbol.name.lower():
+            if _names_relate(keyword, symbol.name.lower()):
                 score += _WEIGHT_SYMBOL * symbol_penalty
                 matched_symbols.append(symbol.name)
                 break  # one hit per keyword per file is enough
@@ -116,6 +116,21 @@ def _score_entry(entry: FileEntry, keywords: Sequence[str]) -> Tuple[float, List
             score += _WEIGHT_LANGUAGE
 
     return score, matched_symbols
+
+
+def _names_relate(keyword: str, symbol_name: str) -> bool:
+    """True if a query word and a symbol name plausibly refer to the same thing.
+
+    Matching is bidirectional on purpose. One-way containment ("is the keyword
+    inside the name?") misses the very common case where the user's word is the
+    longer one — "charges" never matches a function called `charge`, so a request
+    about charges would rank the billing code at zero.
+
+    The length guard keeps short fragments from matching everything.
+    """
+    if keyword in symbol_name:
+        return True
+    return len(symbol_name) >= 4 and symbol_name in keyword
 
 
 def _importers_of(entries: Dict[str, FileEntry], target: str) -> List[str]:

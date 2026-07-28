@@ -34,6 +34,7 @@ from assistant.edits.actions import EditAction, EditRequest
 from config import settings
 
 from ..chat_widgets import ChatInput, _DictationMixin
+from ..progress import AIProgressIndicator
 from assistant.ollama_models import PREFERRED_DEFAULT, choose_default, normalize_name
 
 from .monaco import DEFAULT_MONACO_DIR, MonacoDiffView
@@ -66,6 +67,7 @@ def _section_label(text: str) -> QLabel:
     label = QLabel(text)
     label.setStyleSheet("color: #888; font-size: 11px; margin-top: 4px;")
     return label
+
 
 # Buttons, in the order they appear. Explain is first because it's the only
 # non-mutating action and the safest thing to try on unfamiliar code.
@@ -101,11 +103,15 @@ class AIPanel(QWidget, _DictationMixin):
     describe_project_requested = pyqtSignal()
     reindex_requested = pyqtSignal()
     refresh_models_requested = pyqtSignal()
+    unload_model_requested = pyqtSignal()
     build_kb_requested = pyqtSignal()
     build_general_kb_requested = pyqtSignal()
     # Emitted instead of action_requested when there's no file to act on — the
     # model answers from its own knowledge rather than from project context.
     general_chat_requested = pyqtSignal(str)
+    # Emitted with project context available; the tab infers what to do with it
+    # (plan, discuss, or fix) from the prompt itself rather than an explicit choice.
+    prompt_submitted = pyqtSignal(str)
 
     def __init__(self, monaco_dir: Optional[Path] = None, parent=None):
         super().__init__(parent)
@@ -142,6 +148,16 @@ class AIPanel(QWidget, _DictationMixin):
         self.refresh_models_btn.setFixedWidth(30)
         self.refresh_models_btn.setToolTip("Re-check which models Ollama has installed")
         self.refresh_models_btn.clicked.connect(self.refresh_models_requested)
+        self.unload_model_btn = QPushButton("⏏")
+        self.unload_model_btn.setFixedWidth(30)
+        self.unload_model_btn.setToolTip(
+            "Unload the model from memory.\n\n"
+            "Models are kept loaded between requests so you only pay the load "
+            "time once (config: assistant.keep_model_loaded). That holds several "
+            "gigabytes until you unload here, switch off the setting, or quit "
+            "Ollama. The next request reloads it."
+        )
+        self.unload_model_btn.clicked.connect(self.unload_model_requested)
 
         self._action_buttons = {}
         for action in _ACTION_ORDER:
@@ -170,10 +186,17 @@ class AIPanel(QWidget, _DictationMixin):
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
 
+        # Alongside status_label rather than replacing it: that label also
+        # carries non-progress messages (refusals, results), which shouldn't
+        # vanish when a run completes.
+        self.progress = AIProgressIndicator()
+
         # Speak a prompt instead of typing it — same worker and local whisper
         # model as the Assistant tab's dictation.
-        self._build_dictate_button()
-        self.dictate_btn.setText("🎤")
+        # Icon-only: this panel's button row has no room for "🎤 Dictate", and the
+        # labels have to be passed in so they survive the button being relabelled
+        # on each start/stop.
+        self._build_dictate_button(label="🎤", stop_label="■")
         self.dictate_btn.setFixedWidth(40)
 
         # -- project-wide actions (from the retired Coding Agent tab) ------
@@ -247,6 +270,7 @@ class AIPanel(QWidget, _DictationMixin):
         model_row.addWidget(QLabel("Model:"))
         model_row.addWidget(self.model_combo, 1)
         model_row.addWidget(self.refresh_models_btn)
+        model_row.addWidget(self.unload_model_btn)
         model_row.addWidget(self.new_session_btn)
 
         input_row = QHBoxLayout()
@@ -275,6 +299,7 @@ class AIPanel(QWidget, _DictationMixin):
         layout.addLayout(input_row)
         layout.addWidget(_section_label("Whole project"))
         layout.addLayout(project_row)
+        layout.addWidget(self.progress)
         layout.addWidget(self.status_label)
         return page
 
@@ -308,7 +333,10 @@ class AIPanel(QWidget, _DictationMixin):
     def _update_context_label(self) -> None:
         if not self._active_file:
             self.context_label.setText(
-                "No file open — questions are answered from the model's general knowledge."
+                "No file open — the AI will choose which file to change, or answer from "
+                "general knowledge."
+                if self._project_open
+                else "No file open — questions are answered from the model's general knowledge."
             )
             return
         if self._selection.strip():
@@ -325,21 +353,22 @@ class AIPanel(QWidget, _DictationMixin):
         self.action_requested.emit(action, self.prompt_input.toPlainText().strip())
 
     def _request_implement(self) -> None:
-        """Sends the prompt box's text.
+        """Sends the prompt box's text; the tab infers plan/discuss/fix from it.
 
-        Routes on whether there's a file to act on: with one open this is an
-        IMPLEMENT edit request; without one it's a plain question, answered from
-        the model's own knowledge. That means the panel is useful before a
-        repository has even been opened, rather than being inert.
+        With no repository open there's nothing to plan or fix, so this falls back
+        to a plain question answered from the model's own knowledge — the panel
+        stays useful before a project is chosen.
         """
         instruction = self.prompt_input.toPlainText().strip()
         if not instruction:
             self.status_label.setText("Type something first, or pick an action above.")
             return
-        if self._active_file:
-            self.action_requested.emit(EditAction.IMPLEMENT, instruction)
-        else:
+        # An open file implies a project even if `set_project_open` wasn't called.
+        has_project_context = self._project_open or bool(self._active_file)
+        if not has_project_context:
             self.general_chat_requested.emit(instruction)
+            return
+        self.prompt_submitted.emit(instruction)
 
     def _request_plan(self) -> None:
         issue = self.prompt_input.toPlainText().strip()
@@ -364,6 +393,8 @@ class AIPanel(QWidget, _DictationMixin):
         """Assembles the request from the panel's current context."""
         return EditRequest(
             project_path=project_path,
+            # Empty when nothing is open — `propose_edit` then resolves the target
+            # from the Knowledge Bank rather than refusing.
             rel_path=self._active_file or "",
             action=action,
             instruction=instruction,
@@ -424,12 +455,29 @@ class AIPanel(QWidget, _DictationMixin):
         cursor.movePosition(cursor.MoveOperation.End)
         self.transcript.setTextCursor(cursor)
         self.transcript.insertPlainText(chunk)
+        # The first chunk is what flips the indicator from waiting to
+        # generating, so every streaming path gets that transition for free.
+        self.progress.add_output(chunk)
 
     def append_note(self, text: str) -> None:
         self.transcript.append(f"\n{text}\n")
 
     def set_status(self, text: str) -> None:
         self.status_label.setText(text)
+
+    # -- progress ----------------------------------------------------------
+
+    def begin_progress(self, label: Optional[str] = None) -> None:
+        self.progress.begin(label)
+
+    def set_progress_stage(self, stage: str, label: Optional[str] = None, detail: str = "") -> None:
+        self.progress.set_stage(stage, label, detail)
+
+    def set_counted_progress(self, done: int, total: int, label: Optional[str] = None) -> None:
+        self.progress.set_counted_progress(done, total, label)
+
+    def end_progress(self) -> None:
+        self.progress.end()
 
     # -- review mode -------------------------------------------------------
 
@@ -466,7 +514,23 @@ class AIPanel(QWidget, _DictationMixin):
     # -- enable/disable ----------------------------------------------------
 
     def set_busy(self, busy: bool) -> None:
+        """Marks the panel busy, and drives the progress indicator with it.
+
+        Tying the two together means every request path reports progress without
+        wiring each one individually, and — more importantly — that a bar can't
+        outlive its request: the completion and error paths all clear the busy
+        flag already, so they all tear the indicator down too.
+
+        A caller wanting more specific wording calls `begin_progress` as well;
+        the check below leaves an already-running indicator alone rather than
+        restarting it.
+        """
         self._busy = busy
+        if busy:
+            if not self.progress.state.active:
+                self.progress.begin()
+        else:
+            self.progress.end()
         self._sync_enabled()
 
     def set_project_open(self, is_open: bool) -> None:
@@ -489,6 +553,8 @@ class AIPanel(QWidget, _DictationMixin):
         self.stop_btn.setEnabled(self._busy)
         self.model_combo.setEnabled(not self._busy)
         self.refresh_models_btn.setEnabled(not self._busy)
+        # Unloading mid-request would evict the model out from under it.
+        self.unload_model_btn.setEnabled(not self._busy)
         self.accept_btn.setEnabled(self._has_proposal and not self._busy)
         self.reject_btn.setEnabled(self._has_proposal and not self._busy)
 

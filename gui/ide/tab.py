@@ -35,6 +35,7 @@ from database.json_store import EventStore
 from assistant.project_files import MAX_EDITABLE_BYTES
 
 from .ai_panel import AIPanel
+from ..progress import Stage
 from .editor_tabs import EditorTabs
 from .git_panel import GitPanel
 from .terminal import TerminalDock
@@ -44,9 +45,11 @@ from .repo_bar import KnowledgeBankState, RepoBar
 from ..workers import ApplyWorker, ChatWorker, DevServerWorker, PlanWorker
 from .workers import (
     ApplyEditWorker,
+    DiscussionWorker,
     GeneralBankWorker,
     GitDiffWorker,
     ModelListWorker,
+    ModelUnloadWorker,
     EditProposalWorker,
     ExplainWorker,
     GitCommandWorker,
@@ -54,6 +57,38 @@ from .workers import (
     KnowledgeIndexWorker,
     KnowledgeSummaryWorker,
 )
+
+
+# Question wording that signals "answer me, don't touch anything" — checked
+# first since asking a question about a fix ("why does X break?") should never
+# edit the file it's asking about.
+_DISCUSSION_STARTERS = (
+    "what", "why", "how", "when", "where", "who", "which", "explain", "describe",
+    "does", "is", "are", "can", "could", "should", "would", "will",
+)
+# Wording that signals a change spanning more than one file — the safer default
+# for these is a reviewable plan, not an in-place edit of whatever file happens
+# to be open.
+_PLAN_KEYWORDS = ("plan", "across the project", "across multiple files", "several files", "architecture")
+
+
+def _classify_intent(prompt: str) -> str:
+    """Guesses plan / discussion / code_fix from a free-form prompt.
+
+    Replaces the old explicit mode picker: instead of asking the user to choose
+    up front, infer intent from the prompt's own wording. Defaults to "code_fix"
+    (edit the open file, or let the AI pick a target) since that's what most
+    project-context prompts turn out to be ("fix the off-by-one", "add a
+    --dry-run flag") — the diff-review step before anything is written is the
+    real safety net, not this classification.
+    """
+    text = prompt.strip().lower()
+    if any(keyword in text for keyword in _PLAN_KEYWORDS):
+        return "plan"
+    first_word = text.split(" ", 1)[0] if text else ""
+    if text.endswith("?") or first_word in _DISCUSSION_STARTERS:
+        return "discussion"
+    return "code_fix"
 
 
 def _resolve_vendor_dir(configured: str) -> Path:
@@ -126,8 +161,10 @@ class IDETab(QWidget):
         self._index_worker: Optional[KnowledgeIndexWorker] = None
         self._summary_worker: Optional[KnowledgeSummaryWorker] = None
         self._model_worker: Optional[ModelListWorker] = None
+        self._unload_worker: Optional[ModelUnloadWorker] = None
         self._chat_worker: Optional[ChatWorker] = None
         self._general_worker: Optional[GeneralBankWorker] = None
+        self._discussion_worker: Optional[DiscussionWorker] = None
 
         self._wire_signals()
         self._build_layout()
@@ -206,9 +243,11 @@ class IDETab(QWidget):
         self.ai_panel.describe_project_requested.connect(self.describe_project)
         self.ai_panel.reindex_requested.connect(lambda: self.build_all_knowledge(force_full=True))
         self.ai_panel.refresh_models_requested.connect(self.refresh_models)
+        self.ai_panel.unload_model_requested.connect(self.unload_models)
         self.ai_panel.build_kb_requested.connect(self.build_all_knowledge)
         self.ai_panel.build_general_kb_requested.connect(self.build_general_bank)
         self.ai_panel.general_chat_requested.connect(self._ask_general)
+        self.ai_panel.prompt_submitted.connect(self._run_request)
 
     def _build_layout(self) -> None:
         left = QSplitter(Qt.Orientation.Vertical)
@@ -286,6 +325,10 @@ class IDETab(QWidget):
         self.ai_panel.set_project_open(True)
         self.ai_panel.set_plan_available(False)
         self.ai_panel.return_to_chat()
+        self.ai_panel.append_note(
+            f"Opened {path.name}. Ask a question, describe a change, or use "
+            "'Plan Multi-File Change' below for something spanning several files."
+        )
         self._current_plan = None
         self._current_issue = ""
         self.status_label.setText(f"Opened {path}")
@@ -321,6 +364,38 @@ class IDETab(QWidget):
             self.status_label.setText(
                 "No models found — is `ollama serve` running? (`ollama pull gemma4`)"
             )
+
+    def unload_models(self) -> None:
+        """Releases Ollama's resident models, freeing their memory."""
+        if self._unload_worker is not None:
+            return
+        self.ai_panel.set_status("Unloading the model...")
+        self.ai_panel.set_progress_stage(Stage.WORKING, "Unloading the model...")
+        self._unload_worker = ModelUnloadWorker(
+            settings.get("assistant.base_url", "http://localhost:11434")
+        )
+        self._unload_worker.finished_ok.connect(self._on_models_unloaded)
+        self._unload_worker.error.connect(self._on_unload_error)
+        self._unload_worker.start()
+
+    def _on_models_unloaded(self, unloaded) -> None:
+        self._unload_worker.wait()  # see gui/dashboard.py's _StreamingChatMixin note
+        self._unload_worker = None
+        self.ai_panel.end_progress()
+        if unloaded:
+            self.ai_panel.set_status(
+                f"Unloaded {', '.join(unloaded)} — the next request will reload it."
+            )
+        else:
+            # Not an error: Ollama was reachable and simply had nothing resident,
+            # which is the normal state before the first request of a session.
+            self.ai_panel.set_status("No model was loaded — nothing to unload.")
+
+    def _on_unload_error(self, message: str) -> None:
+        self._unload_worker.wait()
+        self._unload_worker = None
+        self.ai_panel.end_progress()
+        self.ai_panel.set_status(f"Could not unload: {message}")
 
     # -- Knowledge Bank ----------------------------------------------------
 
@@ -431,15 +506,23 @@ class IDETab(QWidget):
         self._index_worker.finished_ok.connect(self._on_index_done)
         self._index_worker.error.connect(self._on_index_error)
         self._index_worker.start()
+        # Indexing doesn't set the panel busy (it doesn't block asking
+        # questions), so the indicator is driven explicitly here. The file count
+        # isn't known until the walk finishes, hence indeterminate to start.
+        self.ai_panel.begin_progress("Indexing the repository...")
 
     def _on_index_progress(self, done: int, total: int) -> None:
         self.repo_bar.set_knowledge_bank_state(
             KnowledgeBankState.INDEXING, f"{done}/{total}"
         )
+        # The one genuinely countable job in the app, so the only one that earns
+        # a real percentage.
+        self.ai_panel.set_counted_progress(done, total, "Indexing the repository...")
 
     def _on_index_done(self, result) -> None:
         self._index_worker.wait()  # see gui/dashboard.py's _StreamingChatMixin note
         self._index_worker = None
+        self.ai_panel.end_progress()
         self._refresh_knowledge_bank_state()
         self.status_label.setText(
             f"Knowledge Bank: {result.summary} in {result.duration_seconds}s — readable copy in "
@@ -449,6 +532,7 @@ class IDETab(QWidget):
     def _on_index_error(self, message: str) -> None:
         self._index_worker.wait()
         self._index_worker = None
+        self.ai_panel.end_progress()
         self.repo_bar.set_knowledge_bank_state(KnowledgeBankState.MISSING)
         self.status_label.setText(f"Could not index this repository: {message}")
 
@@ -635,6 +719,10 @@ class IDETab(QWidget):
             base_url=settings.get("assistant.base_url", "http://localhost:11434"),
             model=self.ai_panel.model,
             timeout_seconds=settings.get("coding_agent.timeout_seconds", 600.0),
+            # `keep_alive` deliberately absent: `streaming.stream_chat` resolves
+            # it from `assistant.keep_model_loaded` itself. Threading it through
+            # every wrapper would mean touching each of `propose_edit`'s internal
+            # helpers too, and missing one would silently ignore the setting.
         )
 
     def _ai_busy(self) -> bool:
@@ -647,15 +735,42 @@ class IDETab(QWidget):
                 self._plan_worker,
                 self._apply_plan_worker,
                 self._chat_worker,
+                self._discussion_worker,
             )
         )
 
+    def _reject_while_busy(self, what: str) -> bool:
+        """Refuses `what` if a worker is still running, and says so.
+
+        These guards used to `return` silently. The panel tracks its own busy
+        flag, so the two could disagree — Send stayed enabled while this refused
+        every click, with nothing on screen to explain why. Re-syncing the panel
+        here makes the button reflect reality, and the message covers the gap
+        until it does.
+        """
+        if not self._ai_busy():
+            return False
+        self.ai_panel.set_busy(True)
+        self.ai_panel.set_status(
+            f"Still working on the previous request — press Stop to cancel it, then {what}."
+        )
+        return True
+
+    def _no_project_for(self, what: str) -> bool:
+        """Refuses `what` when it needs a repository and none is open."""
+        if self._project_path is not None:
+            return False
+        self.ai_panel.set_status(f"Open a repository first — {what} needs one.")
+        return True
+
     def _run_action(self, action: EditAction, instruction: str) -> None:
-        if self._project_path is None or self._ai_busy():
+        if self._no_project_for(action.label.lower()) or self._reject_while_busy("try again"):
             return
         rel_path = self.editor_tabs.current_rel_path()
-        if not rel_path:
-            self.ai_panel.set_status("Open a file first.")
+        # An empty rel_path is only workable for IMPLEMENT, where the model chooses
+        # the target. "Refactor" with nothing selected has no subject.
+        if not rel_path and action is not EditAction.IMPLEMENT:
+            self.ai_panel.set_status(f"{action.label} needs a file open — pick one in the Explorer.")
             return
 
         request = self.ai_panel.build_request(str(self._project_path), action, instruction)
@@ -690,8 +805,10 @@ class IDETab(QWidget):
         self.ai_panel.set_busy(False)
 
     def _start_proposal(self, request, action: EditAction) -> None:
+        target = self.editor_tabs.current_rel_path()
+        where = target if target else "a file the AI will choose"
         self.ai_panel.set_status(
-            f"{action.label}: asking the model... (a local model can take a while)"
+            f"{action.label} on {where}: asking the model..."
         )
         self._proposal_worker = EditProposalWorker(request, self._llm_cfg())
         self._proposal_worker.finished_ok.connect(self._on_proposal_ready)
@@ -713,6 +830,11 @@ class IDETab(QWidget):
         self._current_proposal = proposal
         for warning in proposal.warnings:
             self.ai_panel.append_note(f"⚠ {warning}")
+        # If the model picked the file itself, open it so the diff isn't reviewed
+        # against a file the user can't see.
+        if proposal.rel_path != self.editor_tabs.current_rel_path() and not proposal.is_new:
+            self.editor_tabs.open_file(proposal.rel_path)
+            self.ai_panel.set_active_file(proposal.rel_path)
         self.ai_panel.append_note(
             f"Shadow: proposed {proposal.stats.summary()} in {proposal.rel_path} — review it."
         )
@@ -729,6 +851,9 @@ class IDETab(QWidget):
         if self._current_proposal is None or self._project_path is None:
             return
         self.ai_panel.set_busy(True)
+        # Writing a file, not calling a model — the default stage would
+        # eventually blame a slow model load for a delay that can't be that.
+        self.ai_panel.set_progress_stage(Stage.WORKING, "Applying the edit...")
         self.ai_panel.set_status("Applying...")
         self._apply_worker = ApplyEditWorker(
             self._current_proposal,
@@ -775,14 +900,32 @@ class IDETab(QWidget):
         self.ai_panel.set_status("Rejected.")
 
     def _stop_ai(self) -> None:
-        for worker in (self._explain_worker, self._proposal_worker, self._chat_worker):
+        stoppable = (self._explain_worker, self._proposal_worker, self._chat_worker,
+                     self._discussion_worker)
+        for worker in stoppable:
             if worker is not None:
                 worker.stop()
-        self.ai_panel.set_status("Stopping...")
+        # A worker that has already finished leaves its reference behind if the
+        # completion signal never landed, and `_ai_busy()` then refuses every
+        # subsequent request. Clearing the finished ones here means Stop can
+        # always get the panel back to a usable state.
+        for name in ("_explain_worker", "_proposal_worker", "_apply_worker",
+                     "_plan_worker", "_apply_plan_worker", "_chat_worker",
+                     "_discussion_worker"):
+            worker = getattr(self, name, None)
+            if worker is not None and worker.isFinished():
+                worker.wait()
+                setattr(self, name, None)
+        if self._ai_busy():
+            self.ai_panel.set_status("Stopping...")
+        else:
+            self.ai_panel.set_busy(False)
+            self.ai_panel.set_status("Stopped.")
 
     def _on_ai_error(self, message: str) -> None:
         for name in ("_explain_worker", "_proposal_worker", "_apply_worker",
-                     "_plan_worker", "_apply_plan_worker", "_chat_worker"):
+                     "_plan_worker", "_apply_plan_worker", "_chat_worker",
+                     "_discussion_worker"):
             worker = getattr(self, name, None)
             if worker is not None:
                 worker.wait()
@@ -790,6 +933,57 @@ class IDETab(QWidget):
         self.ai_panel.set_busy(False)
         self.ai_panel.append_note(f"Shadow: {message}")
         self.ai_panel.set_status("Error — see the transcript.")
+
+    def _run_request(self, prompt: str) -> None:
+        """Routes a prompt to whichever of the three project-context paths fits.
+
+        The three stay deliberately different code paths, not one prompt with a
+        preamble: Plan produces a reviewable multi-file plan and can write to a new
+        branch, Discussion only ever reads, and Code Fix edits the open file behind
+        a diff a user must accept before anything is written. `_classify_intent`
+        picks between them from the prompt's own wording, replacing the explicit
+        mode picker that used to make this choice.
+        """
+        if self._reject_while_busy("send it again"):
+            return
+        intent = _classify_intent(prompt)
+        if intent == "plan":
+            self._plan_multi_file(prompt)
+        elif intent == "discussion":
+            self._discuss(prompt)
+        else:
+            # No open file is fine: propose_edit resolves a target from the
+            # Knowledge Bank and reports which file it picked.
+            self._run_action(EditAction.IMPLEMENT, prompt)
+
+    def _discuss(self, question: str) -> None:
+        """Answers a question about the project, grounded in both banks, editing nothing."""
+        if self._no_project_for("discussing the code") or self._reject_while_busy("ask again"):
+            return
+        request = self.ai_panel.build_request(
+            str(self._project_path), EditAction.EXPLAIN, question
+        )
+        request.event_store = self._event_store
+        request.shadow_root = self._shadow_root()
+
+        self.ai_panel.append_user(question)
+        self.ai_panel.append_assistant_prefix()
+        self.ai_panel.clear_prompt()
+        self.ai_panel.set_busy(True)
+        self.ai_panel.set_status("Thinking (nothing will be edited)...")
+
+        self._discussion_worker = DiscussionWorker(request, self._llm_cfg())
+        self._discussion_worker.chunk_ready.connect(self.ai_panel.append_chunk)
+        self._discussion_worker.finished_ok.connect(self._on_discussion_done)
+        self._discussion_worker.error.connect(self._on_ai_error)
+        self._discussion_worker.start()
+
+    def _on_discussion_done(self) -> None:
+        self._discussion_worker.wait()  # see gui/dashboard.py's _StreamingChatMixin note
+        self._discussion_worker = None
+        self.ai_panel.append_note("")
+        self.ai_panel.set_status("")
+        self.ai_panel.set_busy(False)
 
     def _ask_general(self, question: str) -> None:
         """Answers a question with no project context at all.
@@ -800,7 +994,7 @@ class IDETab(QWidget):
         that method for why retrieved screen-OCR context is the wrong thing to
         ground a general coding question in.
         """
-        if self._chat_worker is not None or self._ai_busy():
+        if self._reject_while_busy("ask again"):
             return
         self.ai_panel.append_user(question)
         self.ai_panel.append_assistant_prefix()
@@ -842,7 +1036,7 @@ class IDETab(QWidget):
         separate path rather than merged, because that stricter safety model is
         appropriate for a multi-file rewrite and wrong for an in-place edit.
         """
-        if self._project_path is None or self._ai_busy():
+        if self._no_project_for("planning a change") or self._reject_while_busy("plan it again"):
             return
         self._current_issue = issue
         self.ai_panel.append_user(f"Plan: {issue}")
@@ -975,7 +1169,8 @@ class IDETab(QWidget):
         for name in ("_explain_worker", "_proposal_worker", "_apply_worker",
                      "_plan_worker", "_apply_plan_worker", "_dev_server_worker",
                      "_index_worker", "_summary_worker", "_model_worker",
-                     "_chat_worker", "_general_worker"):
+                     "_chat_worker", "_general_worker", "_discussion_worker",
+                     "_unload_worker"):
             worker = getattr(self, name, None)
             if worker is not None:
                 if hasattr(worker, "stop"):

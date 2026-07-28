@@ -33,6 +33,7 @@ from logger import DataLogger
 from search import SearchEngine
 
 from .chat_widgets import ChatInput, _DictationMixin
+from .progress import AIProgressIndicator
 from .ide import IDETab
 from .workers import (
     CallVoiceCaptureWorker,
@@ -698,6 +699,10 @@ class _StreamingChatMixin:
         cursor.movePosition(cursor.MoveOperation.End)
         self.transcript.setTextCursor(cursor)
         self.transcript.insertPlainText(chunk)
+        # First chunk moves the indicator from waiting to generating; optional so
+        # a host without a progress bar still works.
+        if getattr(self, "progress", None) is not None:
+            self.progress.add_output(chunk)
 
     def _on_finished(self, citations: list) -> None:
         if citations:
@@ -746,6 +751,7 @@ class AssistantTab(QWidget, _StreamingChatMixin, _DictationMixin):
         self.stop_btn.setEnabled(False)
         self.new_session_btn = QPushButton("New Session")
         self.status_label = QLabel("")
+        self.progress = AIProgressIndicator()
         self._build_dictate_button()  # see _DictationMixin
 
         self.suggestions_row = QHBoxLayout()
@@ -777,6 +783,7 @@ class AssistantTab(QWidget, _StreamingChatMixin, _DictationMixin):
         root.addWidget(self.transcript)
         root.addWidget(suggestions_box)
         root.addLayout(input_row)
+        root.addWidget(self.progress)
         root.addWidget(self.status_label)
         self.setLayout(root)
 
@@ -834,6 +841,7 @@ class AssistantTab(QWidget, _StreamingChatMixin, _DictationMixin):
         self.stop_btn.setEnabled(True)
         self.new_session_btn.setEnabled(False)
         self.status_label.setText("Thinking...")
+        self.progress.begin()
 
         self._chat_worker = ChatWorker(self._chat_engine, question)
         self._chat_worker.chunk_ready.connect(self._on_chunk)
@@ -849,6 +857,9 @@ class AssistantTab(QWidget, _StreamingChatMixin, _DictationMixin):
     def _reset_worker(self) -> None:
         self._chat_worker.wait()  # see _StreamingChatMixin's docstring
         self._chat_worker = None
+        # Both the success and error paths land here, so this is the one place
+        # that has to clear the indicator — it can't be left spinning.
+        self.progress.end()
         self.send_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.new_session_btn.setEnabled(True)
@@ -903,6 +914,12 @@ class MainWindow(QMainWindow):
 
     def _update_consent_badge(self) -> None:
         screen_active, mic_active = self.live_tab.is_capturing()
+        # Dictation opens the mic from the Assistant tab and the Code tab's AI
+        # panel, outside LiveMonitorTab's workers entirely. Folded in here so the
+        # badge can't read "Idle" while a dictation recording is running.
+        mic_active = mic_active or any(
+            tab.is_dictating for tab in (self.assistant_tab, self.ide_tab.ai_panel)
+        )
         if screen_active and mic_active:
             text = "● Recording: screen+OCR, mic"
         elif screen_active:
