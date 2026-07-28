@@ -21,12 +21,14 @@ from assistant.edits.actions import (
     apply_proposal,
     propose_edit,
     revert,
+    stream_discussion,
     stream_explanation,
 )
 from assistant.knowledge.export import export_general, export_repo, write_index
 from assistant.knowledge.general import GeneralKnowledgeBank
 from assistant.knowledge.indexer import KnowledgeBank, build_index
 from assistant.ollama_models import resolve_choices
+from assistant.ollama_runtime import unload_all
 from assistant.knowledge.summaries import generate_summary
 from assistant.project_files import MAX_EDITABLE_BYTES, atomic_write_file, list_dir, read_text_file
 
@@ -256,6 +258,38 @@ class ExplainWorker(QThread):
             self.error.emit(str(exc))
 
 
+class DiscussionWorker(QThread):
+    """Streams an answer about the project without editing anything.
+
+    Separate from `ExplainWorker` because discussion doesn't require an open file —
+    the question is often about the project as a whole.
+    """
+
+    chunk_ready = pyqtSignal(str)
+    finished_ok = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, request, llm_cfg: Dict[str, Any], parent=None):
+        super().__init__(parent)
+        self._request = request
+        self._llm_cfg = llm_cfg
+        self._cancelled = False
+
+    def stop(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            for chunk in stream_discussion(self._request, **self._llm_cfg):
+                if self._cancelled:
+                    break
+                self.chunk_ready.emit(chunk)
+            self.finished_ok.emit()
+        except Exception as exc:
+            if not self._cancelled:
+                self.error.emit(str(exc))
+
+
 class EditProposalWorker(QThread):
     """Generates an edit proposal without writing anything.
 
@@ -385,6 +419,30 @@ class ModelListWorker(QThread):
                 fallback=self._fallback,
             )
         )
+
+
+class ModelUnloadWorker(QThread):
+    """Releases Ollama's resident models from memory.
+
+    Threaded for the same reason as `ModelListWorker`: the HTTP call blocks, and
+    evicting a multi-gigabyte model is not instant.
+    """
+
+    finished_ok = pyqtSignal(object)  # list[str] — models actually unloaded
+    error = pyqtSignal(str)
+
+    def __init__(self, base_url: str, timeout_seconds: float = 30.0, parent=None):
+        super().__init__(parent)
+        self._base_url = base_url
+        self._timeout = timeout_seconds
+
+    def run(self) -> None:
+        try:
+            self.finished_ok.emit(
+                unload_all(self._base_url, timeout_seconds=self._timeout)
+            )
+        except Exception as exc:
+            self.error.emit(f"{type(exc).__name__}: {exc}")
 
 
 class GeneralBankWorker(QThread):

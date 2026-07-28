@@ -324,6 +324,61 @@ def build_tests_prompt(
     return "\n".join(parts)
 
 
+DISCUSSION_SYSTEM_PROMPT = (
+    "You are Shadow's coding assistant, discussing a software project with the developer "
+    "who works on it. Answer their question directly and concretely, using the project "
+    "context below when it's relevant and your own knowledge when it isn't. If the context "
+    "doesn't cover something, say so rather than guessing about their specific codebase.\n\n"
+    "This is a discussion, not an edit: explain, compare options, point at the files and "
+    "functions involved, and flag risks. Do NOT output a rewritten file or a patch — if they "
+    "want the change made, they'll switch to Code Fix mode."
+)
+
+
+def build_discussion_prompt(question: str, context: str = "", history: str = "") -> str:
+    """Builds the prompt for discussion mode.
+
+    Deliberately separate from `build_edit_prompt`: the instruction not to emit a
+    patch is the whole point, so a discussion answer stays readable prose instead
+    of a wall of code the user then has to review.
+    """
+    parts = [DISCUSSION_SYSTEM_PROMPT]
+    if context.strip():
+        parts.append(f"\nProject context:\n{context}")
+    if history.strip():
+        parts.append(f"\nConversation so far:\n{history}")
+    parts.append(f"\nQuestion: {question}\nAnswer:")
+    return "\n".join(parts)
+
+
+TARGET_FILE_SYSTEM_PROMPT = (
+    "You are choosing which single file to edit to satisfy a request in the user's own "
+    "codebase. You are given a shortlist of candidate files with the symbols each one "
+    "defines.\n\n"
+    "Reply with ONE line: the exact relative path of the file to change, copied from the "
+    "list. Then, on a second line, one short sentence explaining why. Nothing else — no "
+    "code, no markdown, no numbering.\n"
+    "If a brand-new file is genuinely the right answer, reply with the path it should have, "
+    'prefixed with "NEW: ".'
+)
+
+
+def build_target_file_prompt(instruction: str, candidates: Sequence[Tuple[str, str]]) -> str:
+    """Builds the prompt that asks which file to edit.
+
+    `candidates` is (path, outline) pairs. Constrained to a shortlist rather than
+    the whole tree for two reasons: a small model picks far better from ten options
+    than from ten thousand, and the reply can then be validated against the list so
+    a hallucinated path never reaches the editor.
+    """
+    listing = "\n\n".join(f"{path}\n{outline}" if outline else path for path, outline in candidates)
+    return (
+        f"{TARGET_FILE_SYSTEM_PROMPT}\n\n"
+        f"Candidate files:\n{listing}\n\n"
+        f"Request: {instruction}\n\nFile to edit:"
+    )
+
+
 def build_patch_retry_prompt(original_prompt: str, previous_reply: str, error: str) -> str:
     """Re-asks after an edit couldn't be applied, telling the model what broke.
 

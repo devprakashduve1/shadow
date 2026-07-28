@@ -30,9 +30,11 @@ from ..project_files import (
 from ..prompts import (
     SELECTION_END,
     SELECTION_START,
+    build_discussion_prompt,
     build_edit_prompt,
     build_explain_prompt,
     build_patch_retry_prompt,
+    build_target_file_prompt,
     build_tests_prompt,
 )
 from ..shadow_home import backups_dir, ensure_dir, flatten_rel_path, journal_path
@@ -133,7 +135,9 @@ def _resolve_context(request: EditRequest) -> str:
         return context_for_edit(
             request.project_path,
             f"{request.action.value} {request.instruction}".strip(),
-            open_file=request.rel_path,
+            # May be "" in discussion mode, where no file need be open. Passing
+            # None rather than "" keeps the ranker from pinning a nonexistent path.
+            open_file=request.rel_path or None,
             selection=request.selection,
             event_store=request.event_store,
             shadow_root=request.shadow_root,
@@ -242,6 +246,167 @@ def stream_explanation(
     return stream_chat(prompt, base_url=base_url, model=model, timeout_seconds=timeout_seconds)
 
 
+@dataclass
+class TargetChoice:
+    """Which file an edit should change, when the user didn't name one."""
+
+    rel_path: str
+    is_new: bool = False
+    reason: str = ""
+    candidates: List[str] = field(default_factory=list)
+    chosen_by: str = "model"  # "model" | "ranking" — how it was decided
+
+
+# How many candidates to offer the model. Enough to contain the right answer,
+# few enough that a small model reliably picks from the list rather than
+# inventing something.
+TARGET_SHORTLIST = 10
+
+
+def _shortlist(project_path: Union[str, Path], instruction: str, shadow_root=None):
+    """Ranks candidate files using the Knowledge Bank. Reads no file bodies."""
+    from ..knowledge.context import rank_files
+    from ..knowledge.indexer import KnowledgeBank
+
+    bank = KnowledgeBank(project_path, shadow_root)
+    entries = bank.load_files()
+    if not entries:
+        return [], {}
+    ranked, _symbols = rank_files(entries, instruction, max_files=TARGET_SHORTLIST)
+    if not ranked:
+        # Nothing scored — the request may use vocabulary the code doesn't. Offer
+        # the structurally important files instead of giving up: a model choosing
+        # from the project's hubs and entry points is far more useful than an
+        # error, and the user reviews a diff either way.
+        ranked = _structural_candidates(bank, entries)
+    outlines = {}
+    for path in ranked:
+        entry = entries.get(path)
+        if entry is None:
+            continue
+        names = [s.signature or f"{s.kind} {s.name}" for s in entry.symbols[:8]]
+        outlines[path] = "\n".join(f"  {name}" for name in names)
+    return ranked, outlines
+
+
+def _structural_candidates(bank, entries) -> List[str]:
+    """Fallback shortlist: the files that matter most in the project's shape."""
+    candidates: List[str] = []
+    try:
+        depth = bank.load_depth()
+        candidates.extend(depth.hub_modules[:5])
+        outline = bank.load_outline()
+        candidates.extend(outline.get("entrypoints", [])[:3])
+    except Exception:
+        pass
+    # Then the largest source files, as a crude proxy for "where the logic is".
+    source = [
+        path for path, entry in entries.items()
+        if not entry.skipped and entry.language not in ("unknown", "markdown", "json", "yaml", "text")
+    ]
+    source.sort(key=lambda p: -entries[p].loc)
+    candidates.extend(source)
+    return [p for p in dict.fromkeys(candidates) if p][:TARGET_SHORTLIST]
+
+
+def choose_target_file(
+    project_path: Union[str, Path],
+    instruction: str,
+    *,
+    shadow_root=None,
+    base_url: str = "http://localhost:11434",
+    model: str = "gemma4",
+    timeout_seconds: float = 600.0,
+) -> TargetChoice:
+    """Decides which file to edit for `instruction` when none is open.
+
+    Two stages, deliberately: the Knowledge Bank ranks candidates with zero file
+    reads, then the model picks one from that shortlist. Letting the model choose
+    freely over the whole tree invites a hallucinated path; letting ranking decide
+    alone ignores the *intent* behind the request. Constraining the choice to a
+    ranked shortlist and then validating the answer against it gets both.
+
+    Falls back to the top-ranked candidate if the model's reply isn't usable, so a
+    weak model degrades to "the most relevant file" rather than to an error.
+    """
+    ranked, outlines = _shortlist(project_path, instruction, shadow_root)
+    if not ranked:
+        raise EditError(
+            "No indexed files to choose from. Click \"Index Repo\" to build this "
+            "repository's Knowledge Bank, or open the file you want changed."
+        )
+
+    prompt = build_target_file_prompt(
+        instruction, [(path, outlines.get(path, "")) for path in ranked]
+    )
+    try:
+        raw = "".join(
+            stream_chat(prompt, base_url=base_url, model=model, timeout_seconds=timeout_seconds)
+        )
+    except Exception:
+        return TargetChoice(rel_path=ranked[0], candidates=ranked, chosen_by="ranking",
+                            reason="the model could not be reached; used the best-ranked file")
+
+    choice = _parse_target(raw, ranked)
+    if choice is None:
+        return TargetChoice(
+            rel_path=ranked[0], candidates=ranked, chosen_by="ranking",
+            reason="the model's answer didn't name a known file; used the best-ranked one",
+        )
+    choice.candidates = ranked
+    return choice
+
+
+def _parse_target(raw: str, ranked: List[str]) -> Optional[TargetChoice]:
+    """Reads the model's file choice, rejecting anything not on the shortlist.
+
+    Same anti-hallucination stance as `coding_agent._parse_plan`: a path the model
+    invented must never reach the editor. A `NEW:` path is the one exception, since
+    by definition it isn't in the list yet.
+    """
+    lines = [line.strip().strip("`\"'") for line in strip_code_fence(raw).splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return None
+
+    reason = lines[1][:300] if len(lines) > 1 else ""
+    for line in lines[:3]:  # the path should lead, but tolerate a preamble
+        candidate = line.lstrip("-*").strip()
+        if candidate.upper().startswith("NEW:"):
+            new_path = candidate[4:].strip()
+            if new_path:
+                return TargetChoice(rel_path=new_path, is_new=True, reason=reason)
+        if candidate in ranked:
+            return TargetChoice(rel_path=candidate, reason=reason)
+        # A model often answers with just the filename rather than the full path.
+        matches = [p for p in ranked if Path(p).name == Path(candidate).name]
+        if len(matches) == 1:
+            return TargetChoice(rel_path=matches[0], reason=reason)
+    return None
+
+
+def stream_discussion(
+    request: EditRequest,
+    *,
+    base_url: str = "http://localhost:11434",
+    model: str = "gemma4",
+    timeout_seconds: float = 600.0,
+) -> Iterator[str]:
+    """Streams an answer about the project without proposing any edit.
+
+    Unlike `stream_explanation`, this does **not** require an open file: the
+    question may be about the project as a whole ("how does auth flow work?"), and
+    demanding a file first would make the mode useless for exactly the questions
+    it's best at. When a file *is* open it's included as context via
+    `_resolve_context`, which pins it and its importers.
+    """
+    context = _resolve_context(request)
+    if request.has_selection:
+        context = f"Selected code from {request.rel_path}:\n{request.selection}\n\n{context}"
+    prompt = build_discussion_prompt(request.instruction, context=context)
+    return stream_chat(prompt, base_url=base_url, model=model, timeout_seconds=timeout_seconds)
+
+
 def suggest_test_path(project_path: Union[str, Path], rel_path: str) -> str:
     """Guesses where a test file for `rel_path` should go.
 
@@ -292,6 +457,31 @@ def propose_edit(
             request, base_url=base_url, model=model, timeout_seconds=timeout_seconds, on_chunk=on_chunk
         )
 
+    target_note = ""
+    if not request.rel_path:
+        # No file named, so let the model pick one from a Knowledge-Bank-ranked
+        # shortlist. Recorded as a warning so the UI can show which file it chose
+        # and why — the user should never be surprised by which file changed.
+        choice = choose_target_file(
+            request.project_path,
+            request.instruction,
+            shadow_root=request.shadow_root,
+            base_url=base_url,
+            model=model,
+            timeout_seconds=timeout_seconds,
+        )
+        request.rel_path = choice.rel_path
+        detail = f" — {choice.reason}" if choice.reason else ""
+        target_note = (
+            f"Chose {choice.rel_path} ({'new file' if choice.is_new else choice.chosen_by})"
+            f"{detail}"
+        )
+        if choice.is_new:
+            return _propose_new_file(
+                request, choice, base_url=base_url, model=model,
+                timeout_seconds=timeout_seconds, on_chunk=on_chunk, note=target_note,
+            )
+
     original = _read_for_edit(request.project_path, request.rel_path)
     strategy = _choose_strategy(original)
     file_for_prompt = _mark_selection(original, request.selection) if request.has_selection else original
@@ -308,6 +498,8 @@ def propose_edit(
     )
 
     warnings: List[str] = []
+    if target_note:
+        warnings.append(target_note)
     raw = _collect(prompt, base_url, model, timeout_seconds, on_chunk, should_cancel)
 
     if strategy == STRATEGY_WHOLE_FILE:
@@ -360,6 +552,45 @@ def propose_edit(
         raw=raw,
         original_sha1=_sha1(original),
         warnings=warnings,
+    )
+
+
+def _propose_new_file(
+    request: EditRequest,
+    choice: "TargetChoice",
+    *,
+    base_url: str,
+    model: str,
+    timeout_seconds: float,
+    on_chunk,
+    note: str,
+) -> EditProposal:
+    """Proposes a brand-new file, when the model judged that the right answer."""
+    prompt = build_edit_prompt(
+        request.action.value,
+        choice.rel_path,
+        "(this file does not exist yet — write it from scratch)",
+        instruction=request.instruction,
+        context=_resolve_context(request),
+        strategy=STRATEGY_WHOLE_FILE,
+    )
+    raw = _collect(prompt, base_url, model, timeout_seconds, on_chunk, None)
+    proposed = strip_code_fence(raw).rstrip("\n") + "\n"
+    if not proposed.strip():
+        raise EditError("The model returned no content for the new file.")
+
+    return EditProposal(
+        rel_path=choice.rel_path,
+        original="",
+        proposed=proposed,
+        action=request.action,
+        strategy=STRATEGY_WHOLE_FILE,
+        diff_text=unified_diff_text("", proposed, choice.rel_path),
+        stats=diff_stats("", proposed),
+        raw=raw,
+        is_new=True,
+        original_sha1=_sha1(""),
+        warnings=[note],
     )
 
 

@@ -436,3 +436,156 @@ def test_edit_history_is_newest_first(project: Path, shadow_root: Path) -> None:
 
     assert len(history) == 2
     assert history[0]["sha1_after"] != history[1]["sha1_after"]
+
+
+# -- Code Fix with no file named: the AI picks the target --------------------
+
+
+@pytest.fixture
+def indexed_project(project: Path, shadow_root: Path) -> Path:
+    """The project plus a couple of siblings, with a Knowledge Bank built."""
+    from assistant.knowledge import build_index
+
+    (project / "billing.py").write_text("def charge(amount):\n    return amount\n")
+    (project / "mailer.py").write_text("def send(to):\n    return True\n")
+    build_index(project, shadow_root)
+    return project
+
+
+def _target_request(project: Path, shadow_root: Path, instruction: str) -> EditRequest:
+    return EditRequest(
+        project_path=str(project),
+        rel_path="",  # nothing open — the model chooses
+        action=EditAction.IMPLEMENT,
+        instruction=instruction,
+        shadow_root=str(shadow_root),
+    )
+
+
+def test_model_picks_a_file_from_the_shortlist(indexed_project: Path, shadow_root: Path) -> None:
+    from assistant.edits.actions import choose_target_file
+
+    with patch("urllib.request.urlopen", _fake_model("billing.py\nCharge maths lives here.")):
+        choice = choose_target_file(indexed_project, "charges are wrong", shadow_root=shadow_root)
+
+    assert choice.rel_path == "billing.py"
+    assert choice.chosen_by == "model"
+    assert "Charge maths" in choice.reason
+
+
+def test_a_hallucinated_path_is_rejected(indexed_project: Path, shadow_root: Path) -> None:
+    """Same rule as the plan parser: an invented path must never reach the editor."""
+    from assistant.edits.actions import choose_target_file
+
+    with patch("urllib.request.urlopen", _fake_model("totally/made/up.py\nTrust me.")):
+        choice = choose_target_file(indexed_project, "charge amount", shadow_root=shadow_root)
+
+    assert choice.rel_path != "totally/made/up.py"
+    assert choice.rel_path in choice.candidates
+    assert choice.chosen_by == "ranking"
+
+
+def test_a_bare_filename_resolves_to_its_path(indexed_project: Path, shadow_root: Path) -> None:
+    """Models often answer with just the filename."""
+    from assistant.edits.actions import choose_target_file
+
+    with patch("urllib.request.urlopen", _fake_model("billing.py\nHere.")):
+        choice = choose_target_file(indexed_project, "charge amount", shadow_root=shadow_root)
+
+    assert choice.rel_path == "billing.py"
+
+
+def test_the_model_may_ask_for_a_new_file(indexed_project: Path, shadow_root: Path) -> None:
+    from assistant.edits.actions import choose_target_file
+
+    with patch("urllib.request.urlopen", _fake_model("NEW: retry.py\nNeeds a helper.")):
+        choice = choose_target_file(indexed_project, "add retry logic", shadow_root=shadow_root)
+
+    assert choice.rel_path == "retry.py"
+    assert choice.is_new is True
+
+
+def test_unmatched_vocabulary_still_offers_candidates(
+    indexed_project: Path, shadow_root: Path
+) -> None:
+    """A request using words the code doesn't contain shouldn't dead-end — the
+    project's structurally important files are offered instead."""
+    from assistant.edits.actions import choose_target_file
+
+    with patch("urllib.request.urlopen", _fake_model("billing.py\nBest guess.")):
+        choice = choose_target_file(indexed_project, "zzz qqq wibble", shadow_root=shadow_root)
+
+    assert choice.candidates, "a shortlist must always be offered"
+
+
+def test_unreachable_model_falls_back_to_ranking(indexed_project: Path, shadow_root: Path) -> None:
+    from assistant.edits.actions import choose_target_file
+
+    def broken(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    with patch("urllib.request.urlopen", broken):
+        choice = choose_target_file(indexed_project, "charge amount", shadow_root=shadow_root)
+
+    assert choice.rel_path in choice.candidates
+    assert choice.chosen_by == "ranking"
+
+
+def test_an_unindexed_project_says_what_to_do(project: Path, shadow_root: Path) -> None:
+    from assistant.edits.actions import choose_target_file
+
+    with pytest.raises(EditError, match="Index Repo"):
+        choose_target_file(project, "fix the charge", shadow_root=shadow_root)
+
+
+def test_propose_edit_resolves_its_own_target(indexed_project: Path, shadow_root: Path) -> None:
+    """The whole point: Code Fix works without opening a file first."""
+    opener = _fake_model(
+        "billing.py\nCharge maths lives here.",
+        "def charge(amount):\n    return round(amount, 2)\n",
+    )
+
+    with patch("urllib.request.urlopen", opener):
+        proposal = propose_edit(_target_request(indexed_project, shadow_root, "round charges"))
+
+    assert proposal.rel_path == "billing.py"
+    assert "round(amount, 2)" in proposal.proposed
+    assert opener.state["calls"] == 2, "one call to choose the file, one to edit it"
+
+
+def test_the_chosen_file_is_reported_to_the_user(
+    indexed_project: Path, shadow_root: Path
+) -> None:
+    """Nobody should be surprised by which file changed."""
+    opener = _fake_model("billing.py\nCharge maths lives here.", "def charge(a):\n    return a\n")
+
+    with patch("urllib.request.urlopen", opener):
+        proposal = propose_edit(_target_request(indexed_project, shadow_root, "round charges"))
+
+    assert any("billing.py" in warning for warning in proposal.warnings)
+
+
+def test_resolved_target_still_writes_nothing_until_accepted(
+    indexed_project: Path, shadow_root: Path
+) -> None:
+    before = (indexed_project / "billing.py").read_text()
+    opener = _fake_model("billing.py\nHere.", "def charge(amount):\n    return 0\n")
+
+    with patch("urllib.request.urlopen", opener):
+        propose_edit(_target_request(indexed_project, shadow_root, "round charges"))
+
+    assert (indexed_project / "billing.py").read_text() == before
+
+
+def test_a_model_chosen_new_file_becomes_a_new_file_proposal(
+    indexed_project: Path, shadow_root: Path
+) -> None:
+    opener = _fake_model("NEW: retry.py\nNeeds one.", "def retry(fn):\n    return fn()\n")
+
+    with patch("urllib.request.urlopen", opener):
+        proposal = propose_edit(_target_request(indexed_project, shadow_root, "add retry"))
+
+    assert proposal.rel_path == "retry.py"
+    assert proposal.is_new is True
+    assert proposal.original == ""
+    assert not (indexed_project / "retry.py").exists(), "not written until accepted"

@@ -16,10 +16,27 @@ default input (typically the microphone) sounddevice reports.
 from __future__ import annotations
 
 import queue
+import threading
 from typing import Iterator, Optional
 
 import numpy as np
 import sounddevice as sd
+
+# Frames per callback, as a fraction of the sample rate (i.e. 100ms of audio).
+# Set explicitly because letting PortAudio choose (blocksize=0) yields ~15-frame
+# blocks on macOS when the requested rate differs from the device's native one —
+# roughly a thousand queue pushes a second, all overhead and no benefit.
+_BLOCK_SECONDS = 0.1
+
+
+class NoInputDeviceError(RuntimeError):
+    """Raised when `device_index` resolves to a device with no input channels.
+
+    Distinguishes "wrong device selected" from a stream that opens fine but
+    silently receives nothing because macOS denied microphone permission to
+    the process (PortAudio doesn't raise for that — see `resolved_device_name`
+    on `AudioCapture` for the diagnostic callers can surface instead).
+    """
 
 
 class AudioCapture:
@@ -36,6 +53,12 @@ class AudioCapture:
         self.chunk_seconds = chunk_seconds
         self._queue: "queue.Queue[np.ndarray]" = queue.Queue()
         self._stream: Optional[sd.InputStream] = None
+        self.resolved_device_name: Optional[str] = None
+        # start()/stop() are called from different threads — a GUI thread asking a
+        # worker to stop must be able to release the device (see
+        # `CallVoiceCaptureWorker.stop`), so guard the stream handle rather than
+        # relying on the callers happening not to overlap.
+        self._lock = threading.RLock()
 
     @staticmethod
     def list_devices() -> list:
@@ -45,21 +68,40 @@ class AudioCapture:
         self._queue.put(indata.copy())
 
     def start(self) -> None:
-        if self._stream is not None:
-            return
-        self._stream = sd.InputStream(
-            device=self.device_index,
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            callback=self._callback,
-        )
-        self._stream.start()
+        with self._lock:
+            if self._stream is not None:
+                return
+            device = self.device_index
+            if device is None:
+                device = sd.default.device[0]
+            info = sd.query_devices(device)
+            if info["max_input_channels"] < 1:
+                raise NoInputDeviceError(
+                    f"Device {device!r} ({info['name']}) has no input channels — "
+                    "it looks like an output/playback device. Check audio.device_index."
+                )
+            self.resolved_device_name = info["name"]
+            self._stream = sd.InputStream(
+                device=self.device_index,
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                blocksize=int(self.sample_rate * _BLOCK_SECONDS),
+                callback=self._callback,
+            )
+            self._stream.start()
 
     def stop(self) -> None:
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        """Closes the stream. Idempotent, and safe to call from another thread."""
+        with self._lock:
+            if self._stream is not None:
+                self._stream.stop()
+                self._stream.close()
+                self._stream = None
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._stream is not None
 
     def read_available(self, timeout: float = 0.1) -> Optional[np.ndarray]:
         """Returns the next raw captured block, or None if none arrived in `timeout`.
@@ -81,12 +123,23 @@ class AudioCapture:
             return None
 
     def chunks(self) -> Iterator[np.ndarray]:
-        """Yields concatenated float32 audio chunks of ~chunk_seconds each."""
+        """Yields concatenated float32 audio chunks of ~chunk_seconds each.
+
+        Ends (raising StopIteration) once the stream is stopped, so callers should
+        use `next(chunk_iter, None)` and treat None as "capture ended".
+
+        Polls with a timeout rather than blocking on `get()` forever: an untimed
+        get can never notice `stop()`, because after the stream closes no further
+        blocks arrive to wake it. That left the generator — and whichever thread
+        was pulling from it — wedged permanently, holding the microphone open.
+        """
         self.start()
         samples_needed = int(self.sample_rate * self.chunk_seconds)
         buffer = np.empty((0, self.channels), dtype=np.float32)
-        while self._stream is not None:
-            block = self._queue.get()
+        while self.is_running:
+            block = self.read_available(timeout=_BLOCK_SECONDS)
+            if block is None:
+                continue  # loops back to re-check is_running, so stop() ends this
             buffer = np.concatenate([buffer, block], axis=0)
             if len(buffer) >= samples_needed:
                 yield buffer[:samples_needed]

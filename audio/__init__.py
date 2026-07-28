@@ -1,3 +1,3 @@
-from .audio_capture import AudioCapture
+from .audio_capture import AudioCapture, NoInputDeviceError
 
-__all__ = ["AudioCapture"]
+__all__ = ["AudioCapture", "NoInputDeviceError"]
