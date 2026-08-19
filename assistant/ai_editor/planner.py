@@ -56,72 +56,127 @@ class Planner:
         retrieval: RetrievalResult,
         user_request: str,
     ) -> str:
-        """Build prompt for plan generation."""
+        """Build optimized prompt for plan generation."""
 
         file_list = "\n".join(
-            [f"- {f.file_path} ({len(f.content)} chars, {f.language})"
+            [f"  • {f.file_path} ({len(f.content):,} chars, {f.language})"
              for f in retrieval.files[:8]]
         )
 
         symbols_list = "\n".join(
             [
-                f"- {name}: {loc.type} in {loc.file}:{loc.line}"
+                f"  • {name}: {loc.type} in {loc.file}:{loc.line}"
                 for name, loc in list(retrieval.symbols.items())[:10]
             ]
         )
 
-        prompt = f"""
-REQUEST: {user_request}
+        prompt = f"""# CODE EDITING PLAN GENERATION
 
-INTENT ANALYSIS:
-- Type: {intent.intent_type.value}
-- Complexity: {intent.complexity_score}/5
+## USER REQUEST
+{user_request}
+
+## INTENT ANALYSIS
+- Type: {intent.intent_type.value} (Feature/Fix/Refactor/Test/Docs)
+- Complexity Score: {intent.complexity_score}/5
 - Confidence: {intent.confidence:.0%}
+- Test Coverage Needed: {intent.test_needed}
 
-RELEVANT FILES:
+## RELEVANT CODE CONTEXT
+**Files to Consider:**
 {file_list}
 
-KEY SYMBOLS:
+**Key Symbols/Functions:**
 {symbols_list}
 
-TASK: Create a step-by-step PLAN (NO CODE YET).
+## YOUR TASK
+Create a detailed, step-by-step IMPLEMENTATION PLAN (NOT CODE).
 
-For each step, specify:
-1. Action (understand/modify/create/delete/test)
-2. File to affect
-3. What to change specifically
-4. Why this change matters
+The plan should:
+1. Break down the task into logical, sequential steps
+2. Specify exactly what needs to be modified/created/deleted
+3. Identify dependencies between steps
+4. Consider existing code patterns and frameworks
+5. Ensure changes are coherent and complete
 
-Output ONLY valid JSON (no markdown, no explanation):
+## GUIDELINES
+- Start with UNDERSTANDING the existing code (step 1)
+- Each modification step should have a clear purpose
+- Add tests for any logic changes
+- Update config/imports if needed
+- Be specific: include file paths, function names, line ranges
+- Consider backward compatibility and breaking changes
+- Estimate realistic impact
+
+## ACTION TYPES
+- **understand**: Read/analyze existing code
+- **modify**: Change existing file
+- **create**: Create new file
+- **delete**: Remove file/code
+- **test**: Add tests for changes
+- **config**: Update configuration
+
+## RESPONSE FORMAT
+Return ONLY valid JSON (no markdown, no explanation):
+
 {{
-  "plan_id": "plan-YYYYMMDD-NNN",
-  "summary": "Brief plan overview",
+  "plan_id": "plan-{user_request[:20].replace(' ', '-')}",
+  "summary": "Clear, concise summary of what will be done",
   "steps": [
     {{
       "step_number": 1,
       "action": "understand",
       "file": "path/to/file.py",
-      "goal": "Read current implementation",
-      "details": "Understand what needs to change"
+      "target_function": null,
+      "details": "Understand current implementation and requirements",
+      "reason": "Establish baseline understanding"
     }},
     {{
       "step_number": 2,
       "action": "modify",
       "file": "path/to/file.py",
       "target_function": "function_name",
-      "change_type": "add_logic",
-      "details": "Add new validation logic"
+      "details": "Add validation logic",
+      "reason": "Implement the required validation",
+      "dependencies": [1]
+    }},
+    {{
+      "step_number": 3,
+      "action": "create",
+      "file": "path/to/new_file.py",
+      "target_function": null,
+      "details": "New utility module for validation",
+      "reason": "Separate concerns into new module",
+      "dependencies": [1]
+    }},
+    {{
+      "step_number": 4,
+      "action": "test",
+      "file": "tests/test_new_feature.py",
+      "target_function": null,
+      "details": "Write tests for new functionality",
+      "reason": "Ensure reliability",
+      "dependencies": [2, 3]
     }}
   ],
   "estimated_impact": {{
     "files_to_modify": 1,
-    "files_to_create": 0,
-    "breaking_changes": 0
+    "files_to_create": 1,
+    "files_to_delete": 0,
+    "breaking_changes": 0,
+    "risk_level": "low"
   }},
-  "estimated_tokens": 2500
+  "estimated_tokens": 2500,
+  "assumptions": [
+    "Existing patterns should be followed",
+    "Tests should pass before changes committed"
+  ]
 }}
 
-Start with JSON opening brace immediately.
+**Important:**
+- Return JSON starting with opening brace immediately
+- Include all fields shown in example above
+- Dependencies array specifies which step(s) must complete first
+- Risk levels: low, medium, high, critical
 """
 
         return prompt

@@ -59,71 +59,152 @@ class CodeEditor:
         context: CodeContext,
         previous_error: Optional[str],
     ) -> str:
-        """Build focused prompt for code generation."""
+        """Build optimized prompt for precise code generation."""
 
-        # Show relevant code section
         code_preview = self._extract_relevant_section(
             file_content, step.target_function
         )
-
-        # Build related functions context
         related_context = self._build_related_context(context)
 
-        # Prefix if retry
-        error_prefix = ""
+        error_section = ""
         if previous_error:
-            error_prefix = f"""
-PREVIOUS ATTEMPT FAILED:
-{previous_error}
+            error_section = f"""
+## PREVIOUS ATTEMPT FAILED
+**Error:** {previous_error}
 
-Fix this specific issue. Try a different approach if needed.
+Please analyze what went wrong and try a different approach:
+- Check for exact text matching (whitespace, quotes, indentation)
+- Verify the search pattern exists in the code
+- Try shorter, more specific search strings
+- Consider using insert instead of replace if needed
+
 """
 
-        prompt = f"""
-{error_prefix}
+        prompt = f"""# CODE GENERATION FOR PATCH
 
-FILE: {step.file}
-LANGUAGE: {context.language}
+## CONTEXT
+**File:** `{step.file}` ({context.language})
+**Step:** {step.step_number} - {step.action.upper()}
+**Target:** {step.target_function or "(whole file)"}
 
-CURRENT CODE:
+{error_section}
+
+## CURRENT CODE
+The relevant section you'll be modifying:
+
 ```{context.language}
 {code_preview}
 ```
 
-RELATED FUNCTIONS/CONTEXT:
+## RELATED CONTEXT
+Available symbols and files you can reference:
 {related_context}
 
-CHANGE NEEDED:
-- Target: {step.target_function or "file"}
-- Type: {step.change_type or "modify"}
-- Details: {step.details}
+## CHANGE SPECIFICATION
 
-RULES:
-1. Keep function signature unchanged (if modifying)
-2. Don't touch other functions
-3. Only modify what's specified
-4. Add imports if needed via "add_import" operation
-5. Keep existing logic that's not being changed
+**What to do:** {step.details}
+**Why:** {step.reason or step.goal or "As per plan"}
+**Change Type:** {step.change_type or "general"}
 
-OUTPUT ONLY VALID JSON (no explanation):
+## REQUIREMENTS & CONSTRAINTS
+
+**Must follow:**
+1. ✅ Preserve function signatures (don't change method/function names)
+2. ✅ Only modify what's specified - don't touch other functions
+3. ✅ Maintain code style and indentation
+4. ✅ Keep all existing logic that's not being changed
+5. ✅ Add required imports via add_import operations
+6. ✅ Remove unused imports if applicable
+7. ✅ Follow existing code patterns and conventions
+8. ✅ Ensure changes are syntactically correct
+
+**Avoid:**
+- ❌ Breaking existing functionality
+- ❌ Adding commented-out code
+- ❌ Changing unrelated code
+- ❌ Modifying imports unless necessary
+- ❌ Creating new files (use create action if needed)
+
+## OPERATION TYPES
+
+Use the correct operation for each change:
+
+1. **replace** - Replace specific text
+   - Best for: Changing method bodies, variables, logic
+   - Requires: Exact text to find (search) and replacement text
+
+2. **insert** - Insert new code after a line
+   - Best for: Adding new lines, methods, statements
+   - Requires: Line number (line_start) and text to insert
+
+3. **delete** - Remove code between lines
+   - Best for: Removing lines or code blocks
+   - Requires: Start and end line numbers
+
+4. **add_import** - Add import statement
+   - Best for: Adding new module imports
+   - Requires: Import statement and position (after_line)
+
+5. **remove_import** - Remove import statement
+   - Best for: Removing unused imports
+   - Requires: Import statement to remove
+
+## EXAMPLES
+
+### Example 1: Replace function body
+```json
+{{
+  "type": "replace",
+  "search": "def validate_email(self, email):\\n        return True",
+  "replacement": "def validate_email(self, email):\\n        return '@' in email and '.' in email.split('@')[1]"
+}}
+```
+
+### Example 2: Add import
+```json
+{{
+  "type": "add_import",
+  "import_statement": "from validators import EmailValidator",
+  "after_line": 3
+}}
+```
+
+### Example 3: Insert new method
+```json
+{{
+  "type": "insert",
+  "line_start": 25,
+  "text": "\\n    def new_method(self):\\n        pass"
+}}
+```
+
+## RESPONSE FORMAT
+
+Return ONLY valid JSON (no markdown, no explanation, no notes):
+
+```json
 {{
   "operations": [
     {{
       "type": "replace",
-      "search": "exact_text_to_find",
-      "replacement": "new_text"
+      "search": "exact_text_to_search_for",
+      "replacement": "new_replacement_text"
     }},
     {{
       "type": "add_import",
-      "import_statement": "import something",
+      "import_statement": "import module",
       "after_line": 5
+    }},
+    {{
+      "type": "insert",
+      "line_start": 45,
+      "text": "new code to insert"
     }}
   ]
 }}
+```
 
-Valid operation types: replace, insert, delete, add_import, remove_import
-
-Start with JSON opening brace immediately.
+**Critical:** Start response with opening brace `{{` immediately. No preamble.
 """
 
         return prompt

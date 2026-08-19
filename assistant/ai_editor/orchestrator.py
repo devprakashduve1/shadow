@@ -4,7 +4,7 @@ import logging
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable
 
 from .schemas import (
     CodeContext,
@@ -19,6 +19,8 @@ from .editor import CodeEditor
 from .planner import Planner
 from .retriever import ContextRetriever
 from .validator import Validator
+from .props_analyzer import PropsAnalyzer
+from .review import ReviewManager, PlanReview, ConfirmationRequest
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +42,26 @@ class AICodeEditor:
         self.planner = Planner(llm_client)
         self.editor = CodeEditor(llm_client)
         self.validator = Validator()
+        self.props_analyzer = PropsAnalyzer(llm_client)
+        self.review_manager = ReviewManager()
 
         # Metrics
         self.metrics: Optional[EditMetrics] = None
 
-    def handle_request(self, user_request: str) -> EditResult:
+        # Callback for user confirmation
+        self.confirmation_callback: Optional[
+            Callable[[ConfirmationRequest], bool]
+        ] = None
+
+    def set_confirmation_callback(
+        self, callback: Callable[[ConfirmationRequest], bool]
+    ) -> None:
+        """Set callback for user confirmation during planning."""
+        self.confirmation_callback = callback
+
+    def handle_request(self, user_request: str, require_approval: bool = True) -> EditResult:
         """
-        Main entry point: user request → applied edits.
+        Main entry point: user request → planning → approval → applied edits.
         """
         start_time = time.time()
         request_id = f"req-{int(start_time)}"
@@ -57,6 +72,13 @@ class AICodeEditor:
             logger.info(
                 f"[{request_id}] Intent: {intent.intent_type.value} "
                 f"(confidence: {intent.confidence:.0%})"
+            )
+
+            # Stage 1.5: Analyze props and extract requirements
+            props_analysis = self.props_analyzer.analyze(user_request)
+            logger.info(
+                f"[{request_id}] Props: {len(props_analysis.requirements)} requirements, "
+                f"complexity {props_analysis.estimated_complexity}/5"
             )
 
             # Stage 2: Retrieve context
@@ -70,6 +92,21 @@ class AICodeEditor:
             logger.info(
                 f"[{request_id}] Plan: {len(plan.steps)} steps"
             )
+
+            # Stage 3.5: Create review and request confirmation
+            if require_approval:
+                review = self.review_manager.create_review(plan, props_analysis)
+                confirmation = self._request_user_confirmation(review, request_id)
+
+                if not confirmation.confirmed:
+                    logger.info(f"[{request_id}] User rejected changes")
+                    return EditResult(
+                        success=False,
+                        errors=["User rejected the proposed changes"],
+                        total_time_seconds=time.time() - start_time,
+                    )
+            else:
+                logger.info(f"[{request_id}] Skipping approval (auto mode)")
 
             # Stage 4-8: Apply with retry
             result = self._apply_plan_with_retry(
@@ -94,6 +131,93 @@ class AICodeEditor:
                 errors=[str(e)],
                 total_time_seconds=time.time() - start_time,
             )
+
+    def _request_user_confirmation(
+        self, review: PlanReview, request_id: str
+    ) -> ConfirmationRequest:
+        """Request user confirmation for the plan."""
+        logger.info(f"[{request_id}] Requesting user confirmation")
+
+        # Create confirmation request
+        confirmation = self.review_manager.create_confirmation_request(review)
+
+        # Display plan to user
+        print("\n" + confirmation.review.format_for_display())
+        print(f"\n{'=' * 70}")
+        print("CONFIRMATIONS REQUIRED:")
+        for i, confirm in enumerate(confirmation.required_confirmations, 1):
+            print(f"  {i}. {confirm}")
+        print(f"{'=' * 70}\n")
+
+        # Use callback if provided
+        if self.confirmation_callback:
+            user_approved = self.confirmation_callback(confirmation)
+            confirmation.confirm(user_approved)
+        else:
+            # Default: ask via stdin
+            response = (
+                input(
+                    "Do you want to proceed with these changes? (yes/no): "
+                ).lower().strip()
+            )
+            confirmation.confirm(response in ("yes", "y", "true", "1"))
+
+        return confirmation
+
+    def _get_plan_for_request(self, user_request: str) -> Optional[dict]:
+        """Get plan dict for a request (used by conversational orchestrator)."""
+        try:
+            intent = self._analyze_intent(user_request)
+            props_analysis = self.props_analyzer.analyze(user_request)
+            retrieval = self.retriever.retrieve(intent, max_files=8)
+            plan = self.planner.plan(intent, retrieval, user_request)
+
+            if hasattr(plan, 'to_dict'):
+                return plan.to_dict()
+            else:
+                return {
+                    "plan_id": getattr(plan, 'plan_id', 'unknown'),
+                    "summary": getattr(plan, 'summary', ''),
+                    "steps": [
+                        {
+                            "step_number": s.step_number,
+                            "action": s.action,
+                            "file": s.file,
+                            "target_function": s.target_function,
+                            "details": s.details,
+                            "reason": s.reason,
+                        }
+                        for s in getattr(plan, 'steps', [])
+                    ],
+                }
+        except Exception as e:
+            logger.error(f"Failed to get plan: {e}")
+            return None
+
+    def get_plan_review(
+        self, user_request: str
+    ) -> Optional[PlanReview]:
+        """Get plan review without applying changes (for UI preview)."""
+        try:
+            # Stage 1: Analyze intent
+            intent = self._analyze_intent(user_request)
+
+            # Stage 1.5: Analyze props
+            props_analysis = self.props_analyzer.analyze(user_request)
+
+            # Stage 2: Retrieve context
+            retrieval = self.retriever.retrieve(intent, max_files=8)
+
+            # Stage 3: Plan
+            plan = self.planner.plan(intent, retrieval, user_request)
+
+            # Stage 3.5: Create review
+            review = self.review_manager.create_review(plan, props_analysis)
+
+            return review
+        except Exception as e:
+            logger.error(f"Failed to get plan review: {e}", exc_info=True)
+            return None
 
     def _analyze_intent(self, request: str) -> IntentAnalysis:
         """Stage 1: Analyze user's request."""

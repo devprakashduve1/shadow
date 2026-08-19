@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from typing import Iterator
+from typing import Iterator, Optional
 
 
 class AssistantError(RuntimeError):
@@ -57,29 +57,50 @@ def stream_chat(
     prompt: str,
     *,
     base_url: str = "http://localhost:11434",
-    model: str = "gemma4",
+    model: Optional[str] = None,
+    use_case: Optional[str] = None,
+    loader=None,
     timeout_seconds: float = 180.0,
     keep_alive=None,
 ) -> Iterator[str]:
     """Yields response text chunks as Ollama generates them.
 
-    `think: False` tells Ollama to skip the reasoning/chain-of-thought pass on
-    models that support it (e.g. qwen3.6, deepseek-r1) and go straight to the
-    final answer under `response`. Without it, those models stream their
-    entire reasoning under a separate `thinking` field — which this function
-    doesn't read — while `response` stays empty, so a slow reasoning pass
-    that doesn't finish before `timeout_seconds` looks identical to Ollama
-    returning nothing at all. Models that don't support thinking ignore the
-    field.
+    Phase-aware model selection: if `use_case` provided and `loader` available,
+    automatically selects appropriate model and advances phases as needed.
+    Backward compatible: explicit `model=` parameter still works.
 
-    `keep_alive` left as None resolves the configured policy, which defaults to
-    keeping the model resident rather than accepting Ollama's five-minute idle
-    eviction. Every AI path in the app funnels through here, so that one default
-    keeps the model loaded across a whole session: a large model costs tens of
-    seconds to load, and paying that again after a short pause was the single
-    biggest source of apparent slowness. Use `ollama_runtime.unload_model` to
-    release it deliberately. Pass an explicit value to override.
+    Args:
+        prompt: Input prompt for the model
+        base_url: Ollama server URL (default: http://localhost:11434)
+        model: Model name (e.g., "gemma4"). If None and use_case provided, uses loader.
+        use_case: Use case for phase-aware selection (e.g., "chat", "code_planning")
+        loader: PhaseWiseLoader instance for phase-aware selection (optional)
+        timeout_seconds: Request timeout (default: 180s)
+        keep_alive: Ollama keep_alive value (see resolve_keep_alive)
+
+    Yields:
+        Response text chunks as they arrive from Ollama
+
+    Raises:
+        AssistantError: If Ollama unreachable or returns error
+
+    Notes:
+        - `think: False` skips reasoning on reasoning models (qwen3.6, deepseek-r1)
+        - Phase-aware mode: `use_case` + `loader` override explicit `model`
+        - Backward compatible: existing code with explicit `model=` unchanged
     """
+    # Phase-aware model selection: use_case + loader takes precedence
+    if use_case and loader:
+        try:
+            model = loader.get_model(use_case)
+        except Exception:
+            # Fall back to explicit model if loader fails
+            pass
+
+    # Fallback to default if no model specified
+    if not model:
+        model = "gemma4"
+
     if keep_alive is None:
         keep_alive = resolve_keep_alive()
     payload = json.dumps(
