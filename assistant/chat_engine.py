@@ -60,6 +60,7 @@ class ChatEngine:
         max_context_chars: int = 12000,
         history_limit: int = 10,
         manual_project_registry: Optional[ManualProjectRegistry] = None,
+        phase_loader=None,
     ):
         self._store = event_store
         self._base_url = base_url
@@ -68,6 +69,7 @@ class ChatEngine:
         self._retrieval_days = retrieval_days
         self._max_context_chars = max_context_chars
         self._history_limit = history_limit
+        self._phase_loader = phase_loader  # Optional PhaseWiseLoader for phase-aware selection
         # Same underlying file the Code tab (`gui/ide/`) writes to
         # when the user browses a folder (both point at `event_store.base_dir`
         # by default), so a just-added folder is immediately chattable.
@@ -145,8 +147,14 @@ class ChatEngine:
 
         answer_parts: List[str] = []
         try:
+            # Use phase-aware loader if available, otherwise use explicit model
             for chunk in stream_chat(
-                prompt, base_url=self._base_url, model=model or self._model, timeout_seconds=self._timeout
+                prompt,
+                base_url=self._base_url,
+                model=model or self._model,
+                use_case="chat",
+                loader=self._phase_loader,
+                timeout_seconds=self._timeout
             ):
                 answer_parts.append(chunk)
                 yield chunk
