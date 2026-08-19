@@ -130,6 +130,26 @@ degrades without it) and covered in more detail in [Setup](#setup):
 
 ## Setup
 
+### Quick Start (Recommended)
+
+**One command to install and run everything:**
+
+```bash
+make setup
+```
+
+Or use individual commands:
+```bash
+make install    # Install dependencies only
+make run        # Run the application
+make dev        # Run with debug output
+make clean      # Remove virtual environment & cache
+```
+
+### Manual Setup
+
+If not using Make:
+
 ```bash
 cd shadow
 python3 -m venv .venv
@@ -138,8 +158,14 @@ pip install -r requirements.txt
 python main.py
 ```
 
-That installs everything needed for camera/gesture, screen/OCR, meeting audio
-transcription, and offline spelling checks.
+Or use the scripts directly:
+```bash
+./install.sh    # First time: set up environment
+./run.sh        # Start the application
+./run.sh --dev  # Development mode with debug output
+```
+
+### Vendor Files
 
 If you plan to use the **Code** tab, also fetch its editor and terminal
 JavaScript once — Monaco and xterm.js are ~28MB combined and aren't committed to
@@ -148,6 +174,9 @@ this repo:
 ```bash
 python scripts/fetch_vendor.py
 ```
+
+This installs everything needed for camera/gesture, screen/OCR, meeting audio
+transcription, and offline spelling checks.
 
 Both downloads are pinned by version and sha256. Skipping this leaves every other
 feature working; the Code tab's editor and terminal panels just show these
